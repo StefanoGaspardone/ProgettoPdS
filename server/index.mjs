@@ -8,7 +8,7 @@ const REMOTE_FS_ROOT = './mnt/remote-fs';
 const PORT = 3000;
 const app = express();
 
-app.use(express.text({ type: '*/*' }));
+app.use(express.json());
 app.use(morgan('dev'));
 
 const pathExists = async (filePath) => {
@@ -55,20 +55,23 @@ app.get('/list{/*path}', async (req, res) => {
         const dirPath = req.params.path ? req.params.path.join('/') : '';
         const fullPath = path.resolve(REMOTE_FS_ROOT, dirPath);
         
-        if(!await pathExists(fullPath)) return res.status(404).json({ success: false, message: `No path "${dirPath}" existing` });
+        if(!await pathExists(fullPath)) return res.status(404).json({ success: false, message: `Path "${dirPath}" does not exist` });
+        if(!(await fs.promises.stat(fullPath)).isDirectory()) return res.status(400).json({ success: false, message: `Path "${dirPath}" does not correspond to a directory` });
 
         const contents = await fs.promises.readdir(fullPath);
         const detailedContents = await Promise.all(contents.map(async (name) => {
-            const namePath = path.join(fullPath, name);
+            const namePath = path.resolve(fullPath, name);
             const stats = await fs.promises.stat(namePath);
+            const relativePath = path.relative(REMOTE_FS_ROOT, namePath).replace("\\", "/");
 
             return {
                 name,
+                path: relativePath, 
                 type: stats.isDirectory() ? 'dir' : 'file',
                 size: stats.size,
                 timestamp: stats.mtime,
                 permissions: getPermissionsString(stats.mode, stats.isDirectory()),
-            };
+            }
         }));
 
         return res.status(200).json({ success: true, contents: detailedContents });
@@ -78,4 +81,77 @@ app.get('/list{/*path}', async (req, res) => {
     }
 });
 
+// Read file contents
+app.get('/files{/*path}', async (req, res) => {
+    try {
+        const filePath = req.params.path ? req.params.path.join('/') : '';
+        const fullPath = path.resolve(REMOTE_FS_ROOT, filePath);
+        
+        if(!await pathExists(fullPath)) return res.status(404).json({ success: false, message: `Path "${filePath}" does not exist` });
+        if((await fs.promises.stat(fullPath)).isDirectory()) return res.status(400).json({ success: false, message: `Path "${filePath}" does not correspond to a file` });
+
+        const content = await fs.promises.readFile(fullPath, 'utf-8');
+        return res.status(200).json({ success: true, content  });
+    } catch(error) {
+        console.log(error);
+        return res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// Write file contents
+app.put('/files{/*path}', async (req, res) => {
+    try {
+        const { content } = req.body;
+        if(!content) return res.status(400).json({ success: false, message: 'File content is required' });
+
+        const filePath = req.params.path ? req.params.path.join('/') : '';
+        const fullPath = path.resolve(REMOTE_FS_ROOT, filePath);
+        
+        if(await pathExists(fullPath) && (await fs.promises.stat(fullPath)).isDirectory()) return res.status(400).json({ success: false, message: `Path "${filePath}" does not correspond to a file` });
+
+        const dirPath = path.dirname(fullPath);
+        await fs.promises.mkdir(dirPath, { recursive: true });
+
+        await fs.promises.writeFile(fullPath, content);
+        return res.status(201).json({ success: true, message: `File "${filePath}" written successfully` });
+    } catch(error) {
+        console.log(error);
+        return res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// Create directory
+app.post('/mkdir{/*path}', async (req, res) => {
+    try {
+        const dirPath = req.params.path ? req.params.path.join('/') : '';
+        const fullPath = path.resolve(REMOTE_FS_ROOT, dirPath);
+
+        if(await pathExists(fullPath)) return res.status(409).json({ success: false, message: `Path "${dirPath}" already exists` });
+    
+        await fs.promises.mkdir(fullPath, { recursive: true });
+        return res.status(201).json({ success: true, message: `Directory "${dirPath}" created successfully` });
+    } catch(error) {
+        console.log(error);
+        return res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// Delete file or repository
+app.delete('/files{/*path}', async (req, res) => {
+    try {
+        const dirPath = req.params.path ? req.params.path.join('/') : '';
+        const fullPath = path.resolve(REMOTE_FS_ROOT, dirPath);
+        
+        if(dirPath === '') return res.status(409).json({ success: false, message: 'You cannot remove the whole file system' });
+        if(!await pathExists(fullPath)) return res.status(404).json({ success: false, message: `Path "${dirPath}" does not exist` });
+    
+        await fs.promises.rm(fullPath, { recursive: true });
+        return res.status(200).json({ success: true, message: `Path "${dirPath}" deleted successfully` });
+    } catch(error) {
+        console.log(error);
+        return res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+/* RUN THE SERVER */
 app.listen(PORT, () => console.log(`SERVER LISTENING ON http://localhost:${PORT}`));
