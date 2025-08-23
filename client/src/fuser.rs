@@ -8,6 +8,9 @@ use std::path::PathBuf;
 use std::io::ErrorKind;
 use bytes::Bytes;
 use reqwest::StatusCode;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::thread;
+use std::process;
 
 use crate::{RemoteFilesystem, FileInfo};
 
@@ -274,10 +277,33 @@ pub fn run_fuser_client(filesystem: RemoteFilesystem) {
     let mountpoint = "mnt/remote-fs";
     println!("Mounting filesystem at {}", mountpoint);
 
-    let res = mount2(filesystem, mountpoint, &[]);
-    if let Err(err) = res {
-        println!("Error while mounting the filesystem: {}", err);
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+    
+    ctrlc::set_handler(move || {
+        println!("Received shutdown signal, unmounting...");
+        r.store(false, Ordering::SeqCst);
+    }).expect("Error setting Ctrl-C handler");
+
+    let handle = thread::spawn(move || {
+        let res = mount2(filesystem, mountpoint, &[]);
+        if let Err(err) = res {
+            println!("Error while mounting the filesystem: {}", err);
+            process::exit(1);
+        }
+    });
+    
+    while running.load(Ordering::SeqCst) {
+        thread::sleep(std::time::Duration::from_millis(100));
     }
+    
+    let _ = std::process::Command::new("fusermount")
+        .arg("-u")
+        .arg(mountpoint)
+        .status();
+
+    println!("Filesystem unmounted, exiting.");
+    let _ = handle.join();
 }
 
 fn parse_permissions(perm_str: &str) -> u16 {
