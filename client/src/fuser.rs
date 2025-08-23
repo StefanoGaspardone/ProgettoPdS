@@ -11,7 +11,6 @@ use reqwest::StatusCode;
 
 use crate::{RemoteFilesystem, FileInfo};
 
-
 const TTL: Duration = Duration::from_secs(1);
 
 impl Filesystem for RemoteFilesystem {
@@ -51,9 +50,8 @@ impl Filesystem for RemoteFilesystem {
         if let Some((_, file_info)) = metadata_cache.get(&path) {
             let timestamp_seconds = file_info.timestamp.parse::<u64>().unwrap_or(0);
             let timestamp = UNIX_EPOCH + Duration::from_secs(timestamp_seconds);
-
-            // TODO implementare logica per conversione dei permessi
-            let perm = if file_info.file_type == "dir" { 0o755 } else { 0o644 };
+            
+            let perm = parse_permissions(&file_info.permissions);
             
             let attr = FileAttr {
                 ino,
@@ -100,7 +98,9 @@ impl Filesystem for RemoteFilesystem {
 
         let url = self.server_url.join(&format!("/list/{}", path)).unwrap();
         let files: Vec<FileInfo> = match self.runtime.block_on(async {
-            reqwest::get(url).await?.json().await
+            let client = reqwest::Client::new();
+            let res = client.get(url).await.send().await?;
+            res.json().await
         }) {
             Ok(f) => f,
             Err(_) => {
@@ -188,6 +188,113 @@ impl Filesystem for RemoteFilesystem {
         };
 
         let dir_name = name.to_str().unwrap();
-        let path = format!("{}/{}", parent_path,sssssssssss);
+        let path = format!("{}/{}", parent_path, dir_name);
+
+        let url = self.server_url.join(&format!("/mkdir/{}", path)).unwrap();
+        let res = self.runtime.block_on(async {
+            let client = reqwest::Client::new();
+            let res = client.post(url).send().await.unwrap();
+            res.status()
+        });
+
+        if res.is_success() {
+            let attr = FileAttr {
+                ino: self.next_inode,
+                size: 0,
+                blocks: 0,
+                atime: SystemTime::now(),
+                mtime: SystemTime::now(),
+                ctime: SystemTime::now(),
+                crtime: SystemTime::now(),
+                kind: FileType::Directory,
+                perm: mode as u16,
+                nlink: 2,
+                uid: 0,
+                gid: 0,
+                rdev: 0,
+                flags: 0,
+                blksize: 512,
+            };
+
+            let mut metadata_cache = self.metadata_cache.lock().unwrap();
+            let mut inode_cache = self.inode_cache.lock().unwrap();
+            let file_info = FileInfo {
+                name: dir_name.to_string(),
+                path: path.clone(),
+                file_type: "dir".to_string(),
+                size: 0,
+                timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs().to_string(),
+                permissions: format!("{:o}", mode),
+            };
+            metadata_cache.insert(path.clone(), (self.next_inode, file_info));
+            inode_cache.insert(self.next_inode, path.clone());
+
+            self.next_inode += 1;
+            reply.attr(&TTL, &attr);
+        } else {
+            repky.error(EIO);
+        }
     }
+
+    fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        let inode_cache = self.inode_cache.lock().unwrap();
+        let parent_path = if let Some(p) = inode_cache.get(&parent) {
+            p.clone()
+        } else {
+            reply.error(ENOENT);
+            return;
+        };
+
+        let file_name = name.to_str().unwrap();
+        let path = format!("{}/{}", parent_path, file_name);
+
+        let url = self.server_url.join(&format!("/files/{}", path)).unwrap();
+        let res = self.runtime.block_on(async {
+            let client = reqwest::Client::new();
+            let res = client.delete(url).send().await.unwrap();
+            res.status()
+        });
+        
+        if res.is_success() {
+            let mut metadata_cache = self.metadata_cache.lock().unwrap();
+            let mut inode_cache = self.inode_cache.lock().unwrap();
+
+            if let Some((ino, _)) = metadata_cache.remove(&path) {
+                inode_cache.remove(&ino);
+            }
+
+            reply.ok();
+        } else {
+            reply.error(EIO);
+        }
+    }
+}
+
+pub fn run_fuser_client(filesystem: RemoteFilesystem) {
+    let mountpoint = "mnt/remote-fs";
+    println!("Mounting filesystem at {}", mountpoint);
+
+    let res = mount2(filesystem, mountpoint, &[]);
+    if let Err(err) = res {
+        println!("Error while mounting the filesystem: {}", err);
+    }
+}
+
+fn parse_permissions(perm_str: &str) -> u16 {
+    let mut perm = 0;
+    let chars: Vec<char> = perm_str.chars().collect();
+
+    if chars.len() == 9 {
+        if chars[0] == 'r' { perm |= 0o400; }
+        if chars[1] == 'w' { perm |= 0o200; }
+        if chars[2] == 'x' { perm |= 0o100; }
+        if chars[3] == 'r' { perm |= 0o040; }
+        if chars[4] == 'w' { perm |= 0o020; }
+        if chars[5] == 'x' { perm |= 0o010; }
+        if chars[6] == 'r' { perm |= 0o004; }
+        if chars[7] == 'w' { perm |= 0o002; }
+        if chars[8] == 'x' { perm |= 0o001; }
+    }
+
+    perm
 }
