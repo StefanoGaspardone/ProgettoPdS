@@ -33,8 +33,7 @@ const getPermissionsString = (mode, isDirectory) => {
     const isOthersWrite = (mode & fs.constants.S_IWOTH) !== 0;
     const isOthersExecute = (mode & fs.constants.S_IXOTH) !== 0;
 
-    let perms = isDirectory ? 'd' : '-';
-    perms += isOwnerRead ? 'r' : '-';
+    let perms = isOwnerRead ? 'r' : '-';
     perms += isOwnerWrite ? 'w' : '-';
     perms += isOwnerExecute ? 'x' : '-';
     perms += isGroupRead ? 'r' : '-';
@@ -67,14 +66,14 @@ app.get('/list{/*path}', async (req, res) => {
             return {
                 name,
                 path: relativePath, 
-                type: stats.isDirectory() ? 'dir' : 'file',
+                file_type: stats.isDirectory() ? 'dir' : 'file',
                 size: stats.size,
-                timestamp: stats.mtime,
+                timestamp: Math.floor(new Date(stats.mtime).getTime() / 1000),
                 permissions: getPermissionsString(stats.mode, stats.isDirectory()),
             }
         }));
 
-        return res.status(200).json({ success: true, contents: detailedContents });
+        return res.status(200).json(detailedContents);
     } catch(error) {
         console.log(error);
         return res.status(500).json({ success: false, message: error.message });
@@ -90,8 +89,9 @@ app.get('/files{/*path}', async (req, res) => {
         if(!await pathExists(fullPath)) return res.status(404).json({ success: false, message: `Path "${filePath}" does not exist` });
         if((await fs.promises.stat(fullPath)).isDirectory()) return res.status(400).json({ success: false, message: `Path "${filePath}" does not correspond to a file` });
 
-        const content = await fs.promises.readFile(fullPath, 'utf-8');
-        return res.status(200).json({ success: true, content  });
+        const content = await fs.promises.readFile(fullPath);
+        res.set('Content-Type', 'application/octet-stream');
+        return res.status(200).send(content);
     } catch(error) {
         console.log(error);
         return res.status(500).json({ success: false, message: error.message });
@@ -113,7 +113,7 @@ app.put('/files{/*path}', async (req, res) => {
         await fs.promises.mkdir(dirPath, { recursive: true });
 
         await fs.promises.writeFile(fullPath, content);
-        return res.status(201).json({ success: true, message: `File "${filePath}" written successfully` });
+        return res.status(201).end();
     } catch(error) {
         console.log(error);
         return res.status(500).json({ success: false, message: error.message });
@@ -129,7 +129,7 @@ app.post('/mkdir{/*path}', async (req, res) => {
         if(await pathExists(fullPath)) return res.status(409).json({ success: false, message: `Path "${dirPath}" already exists` });
     
         await fs.promises.mkdir(fullPath, { recursive: true });
-        return res.status(201).json({ success: true, message: `Directory "${dirPath}" created successfully` });
+        return res.status(201).end();
     } catch(error) {
         console.log(error);
         return res.status(500).json({ success: false, message: error.message });
@@ -146,7 +146,7 @@ app.delete('/files{/*path}', async (req, res) => {
         if(!await pathExists(fullPath)) return res.status(404).json({ success: false, message: `Path "${dirPath}" does not exist` });
     
         await fs.promises.rm(fullPath, { recursive: true });
-        return res.status(200).json({ success: true, message: `Path "${dirPath}" deleted successfully` });
+        return res.status(200).end();
     } catch(error) {
         console.log(error);
         return res.status(500).json({ success: false, message: error.message });
