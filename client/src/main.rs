@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::time::UNIX_EPOCH;
+use std::{collections::HashMap, time::SystemTime};
 use std::sync::Mutex;
 use tokio::runtime::Runtime;
 use reqwest::Url;
@@ -15,13 +16,13 @@ mod fuser;
 use fuser::run_fuser_client;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-struct FileInfo {
+pub struct FileInfo {
     name: String,
     path: String,
-    #[serde(rename = "type")]
+    #[serde(rename = "file_type")]
     file_type: String,
     size: usize,
-    timestamp: String,
+    timestamp: u64,
     permissions: String,
 }
 
@@ -35,12 +36,27 @@ pub struct RemoteFilesystem {
 
 impl RemoteFilesystem {
     pub fn new(server_url: &str) -> Self {
+        const FUSE_ROOT_ID: u64 = 1;
+        let mut metadata_cache = HashMap::new();
+        let mut inode_cache = HashMap::new();
+
+        let root_info = FileInfo {
+            name: "".to_string(),
+            path: "".to_string(),
+            file_type: "dir".to_string(),
+            size: 0,
+            timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            permissions: "755".to_string(),
+        };
+        metadata_cache.insert("".to_string(), (FUSE_ROOT_ID, root_info));
+        inode_cache.insert(FUSE_ROOT_ID, "".to_string());
+
         Self {
-            server_url: Url::parse(server_url).expect("Invalid server URL"), 
-            runtime: Runtime::new().expect("Failed to create Tokio runtime"),  
-            metadata_cache: Mutex::new(HashMap::new()),
-            inode_cache: Mutex::new(HashMap::new()),
-            next_inode: 2,
+            server_url: Url::parse(server_url).expect("Invalid server URL"),
+            runtime: Runtime::new().expect("Failed to create Tokio runtime"),
+            metadata_cache: Mutex::new(metadata_cache),
+            inode_cache: Mutex::new(inode_cache),
+            next_inode: FUSE_ROOT_ID + 1,
         }
     }
 }
