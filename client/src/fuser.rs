@@ -343,7 +343,7 @@ impl Filesystem for RemoteFilesystem {
 
 pub fn run_fuser_client(filesystem: RemoteFilesystem) {
     let mountpoint = "mnt/remote-fs";
-    println!("Mounting filesystem at {}", mountpoint);
+    println!("Mounting filesystem at {}", mountpoint); // TODO wait for server
 
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
