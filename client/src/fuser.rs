@@ -374,7 +374,9 @@ impl Filesystem for RemoteFilesystem {
     }
 
     fn mkdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, mode: u32, _umask: u32, reply: fuser::ReplyEntry) {
-        let inode_cache = self.inode_cache.lock().unwrap();
+        println!("Performing mkdir");
+        
+        let mut inode_cache = self.inode_cache.lock().unwrap();
         let parent_path = if let Some(p) = inode_cache.get(&parent) {
             p.clone()
         } else {
@@ -412,7 +414,6 @@ impl Filesystem for RemoteFilesystem {
             };
 
             let mut metadata_cache = self.metadata_cache.lock().unwrap();
-            let mut inode_cache = self.inode_cache.lock().unwrap();
             let file_info = FileInfo {
                 name: dir_name.to_string(),
                 path: path.clone(),
@@ -433,7 +434,9 @@ impl Filesystem for RemoteFilesystem {
     }
 
     fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        let inode_cache = self.inode_cache.lock().unwrap();
+        println!("Performing rmdir (file)");
+        
+        let mut inode_cache = self.inode_cache.lock().unwrap();
         let parent_path = if let Some(p) = inode_cache.get(&parent) {
             p.clone()
         } else {
@@ -448,13 +451,48 @@ impl Filesystem for RemoteFilesystem {
         let res = self.runtime.block_on(async {
             let client = reqwest::Client::new();
             let res = client.delete(url).send().await.unwrap();
+            
             res.status()
         });
         
         if res.is_success() {
             let mut metadata_cache = self.metadata_cache.lock().unwrap();
-            let mut inode_cache = self.inode_cache.lock().unwrap();
+            
+            if let Some((ino, _)) = metadata_cache.remove(&path) {
+                inode_cache.remove(&ino);
+            }
 
+            reply.ok();
+        } else {
+            reply.error(EIO);
+        }
+    }
+
+    fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        println!("Performing rmdir (dir)");
+        
+        let mut inode_cache = self.inode_cache.lock().unwrap();
+        let parent_path = if let Some(p) = inode_cache.get(&parent) {
+            p.clone()
+        } else {
+            reply.error(ENOENT);
+            return;
+        };
+
+        let dir_name = name.to_str().unwrap();
+        let path = format!("{}/{}", parent_path, dir_name);
+
+        let url = self.server_url.join(&format!("/files/{}", path)).unwrap();
+        let res = self.runtime.block_on(async {
+            let client = reqwest::Client::new();
+            let res = client.delete(url).send().await.unwrap();
+            
+            res.status()
+        });
+        
+        if res.is_success() {
+            let mut metadata_cache = self.metadata_cache.lock().unwrap();
+            
             if let Some((ino, _)) = metadata_cache.remove(&path) {
                 inode_cache.remove(&ino);
             }
