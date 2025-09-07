@@ -99,11 +99,10 @@ app.get('/files{/*path}', async (req, res) => {
 });
 
 // Write file contents
-app.put('/files{/*path}', async (req, res) => {
+app.put('/files{/*path}', express.raw({ type: '*/*', limit: '50mb' }), async (req, res) => {
     try {
-        const { content } = req.body;
-        if(!content) return res.status(400).json({ success: false, message: 'File content is required' });
-
+        const data = req.body;
+        
         const filePath = req.params.path ? req.params.path.join('/') : '';
         const fullPath = path.resolve(REMOTE_FS_ROOT, filePath);
         
@@ -112,8 +111,10 @@ app.put('/files{/*path}', async (req, res) => {
         const dirPath = path.dirname(fullPath);
         await fs.promises.mkdir(dirPath, { recursive: true });
 
-        await fs.promises.writeFile(fullPath, content);
-        return res.status(201).end();
+        await fs.promises.writeFile(fullPath, data);
+        
+        const stats = await fs.promises.stat(fullPath);
+        return res.status(201).json({ size: stats.size });
     } catch(error) {
         console.log(error);
         return res.status(500).json({ success: false, message: error.message });
@@ -148,6 +149,31 @@ app.delete('/files{/*path}', async (req, res) => {
         await fs.promises.rm(fullPath, { recursive: true });
         return res.status(200).end();
     } catch(error) {
+        console.log(error);
+        return res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// Stat file or directory (per FUSE getattr/lookup)
+app.get('/stat{/*path}', async (req, res) => {
+    try {
+        const filePath = req.params.path ? req.params.path.join('/') : '';
+        const fullPath = path.resolve(REMOTE_FS_ROOT, filePath);
+        
+        if (!await pathExists(fullPath)) return res.status(404).json({ success: false, message: `Path "${filePath}" does not exist` });
+        
+        const stats = await fs.promises.stat(fullPath);
+        const isDir = stats.isDirectory();
+        
+        return res.status(200).json({
+            name: path.basename(fullPath),
+            path: path.relative(REMOTE_FS_ROOT, fullPath).replace(/\\/g, "/"),
+            file_type: isDir ? 'dir' : 'file',
+            size: stats.size,
+            timestamp: Math.floor(stats.mtimeMs / 1000),
+            permissions: getPermissionsString(stats.mode, isDir),
+        });
+    } catch (error) {
         console.log(error);
         return res.status(500).json({ success: false, message: error.message });
     }
