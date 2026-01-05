@@ -101,7 +101,8 @@ app.get('/files{/*path}', async (req, res) => {
 // Write file contents
 app.put('/files{/*path}', express.raw({ type: '*/*', limit: '50mb' }), async (req, res) => {
     try {
-        const data = req.body;
+        // Ensure data is at least an empty Buffer to prevent fs.writeFile from crashing
+        const data = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
         
         const filePath = req.params.path ? req.params.path.join('/') : '';
         const fullPath = path.resolve(REMOTE_FS_ROOT, filePath);

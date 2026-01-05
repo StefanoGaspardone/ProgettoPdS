@@ -80,8 +80,12 @@ impl Filesystem for RemoteFilesystem {
             format!("{}/{}", parent_path, file_name)
         };
 
-        let ino = self.next_inode;
-        self.next_inode += 1;
+        let ino = {
+            let mut next_inode = self.next_inode.lock().unwrap();
+            let val = *next_inode;
+            *next_inode += 1;
+            val
+        };
 
         let now = SystemTime::now();
         let attr = FileAttr {
@@ -153,8 +157,12 @@ impl Filesystem for RemoteFilesystem {
                 }
             };
 
-            let new_inode = self.next_inode;
-            self.next_inode += 1;
+            let new_inode = {
+                let mut next_inode = self.next_inode.lock().unwrap();
+                let val = *next_inode;
+                *next_inode += 1;
+                val
+            };
 
             metadata_cache.insert(path.clone(), (new_inode, file_info.clone()));
             
@@ -287,8 +295,9 @@ impl Filesystem for RemoteFilesystem {
             let inode = if let Some((ino, _)) = metadata_cache.get(&file.path) {
                 *ino
             } else {
-                let new_inode = self.next_inode;
-                self.next_inode += 1;
+                let mut next_inode = self.next_inode.lock().unwrap();
+                let new_inode = *next_inode;
+                *next_inode += 1;
                 metadata_cache.insert(file.path.clone(), (new_inode, file.clone()));
                 inode_cache.insert(new_inode, file.path.clone());
                 new_inode
@@ -395,8 +404,12 @@ impl Filesystem for RemoteFilesystem {
         });
 
         if res.is_success() {
+            let mut next_inode_guard = self.next_inode.lock().unwrap();
+            let ino = *next_inode_guard;
+            *next_inode_guard += 1;
+
             let attr = FileAttr {
-                ino: self.next_inode,
+                ino,
                 size: 0,
                 blocks: 0,
                 atime: SystemTime::now(),
@@ -422,10 +435,8 @@ impl Filesystem for RemoteFilesystem {
                 timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
                 permissions: format!("{:o}", mode),
             };
-            metadata_cache.insert(path.clone(), (self.next_inode, file_info));
-            inode_cache.insert(self.next_inode, path.clone());
-
-            self.next_inode += 1;
+            metadata_cache.insert(path.clone(), (ino, file_info));
+            inode_cache.insert(ino, path.clone());
             
             reply.entry(&TTL, &attr, 0);
         } else {
@@ -528,8 +539,13 @@ pub fn run_fuser_client(filesystem: RemoteFilesystem) {
         thread::sleep(std::time::Duration::from_millis(100));
     }
     
+    #[cfg(target_os = "linux")]
     let _ = std::process::Command::new("fusermount")
         .arg("-u")
+        .arg(mountpoint)
+        .status();
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("umount")
         .arg(mountpoint)
         .status();
 

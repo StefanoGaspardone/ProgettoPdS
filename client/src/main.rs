@@ -6,13 +6,13 @@ use reqwest::Url;
 use serde::{Serialize, Deserialize};
 
 #[cfg(target_os = "windows")]
-mod winfsp;
+mod dokany;
 #[cfg(target_os = "windows")]
-use winfsp::run_winfsp_client;
+use dokany::run_dokany_client;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod fuser;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use fuser::run_fuser_client;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -26,12 +26,13 @@ pub struct FileInfo {
     permissions: String,
 }
 
+// Implement Sync + Send for RemoteFilesystem to be safe for Dokan callbacks
 pub struct RemoteFilesystem {
     pub server_url: Url,
     pub runtime: Runtime,
     pub metadata_cache: Mutex<HashMap<String, (u64, FileInfo)>>,
     pub inode_cache: Mutex<HashMap<u64, String>>,
-    pub next_inode: u64,
+    pub next_inode: Mutex<u64>,
 }
 
 impl RemoteFilesystem {
@@ -56,7 +57,7 @@ impl RemoteFilesystem {
             runtime: Runtime::new().expect("Failed to create Tokio runtime"),
             metadata_cache: Mutex::new(metadata_cache),
             inode_cache: Mutex::new(inode_cache),
-            next_inode: FUSE_ROOT_ID + 1,
+            next_inode: Mutex::new(FUSE_ROOT_ID + 1),
         }
     }
 }
@@ -66,8 +67,8 @@ fn main() {
     let filesystem = RemoteFilesystem::new(server_url);
 
     #[cfg(target_os = "windows")]
-    run_winfsp_client(filesystem);
+    run_dokany_client(filesystem);
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     run_fuser_client(filesystem);
 }
