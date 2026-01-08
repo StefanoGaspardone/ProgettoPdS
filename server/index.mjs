@@ -1,7 +1,7 @@
 import express from 'express';
 import morgan from 'morgan';
-import fs from 'fs';
-import path from 'path';
+import fs from 'node:fs';
+import path from 'node:path';
 
 const REMOTE_FS_ROOT = './mnt/remote-fs';
 
@@ -168,7 +168,7 @@ app.get('/stat{/*path}', async (req, res) => {
         
         return res.status(200).json({
             name: path.basename(fullPath),
-            path: path.relative(REMOTE_FS_ROOT, fullPath).replace(/\\/g, "/"),
+            path: path.relative(REMOTE_FS_ROOT, fullPath).replaceAll('\\', "/"),
             file_type: isDir ? 'dir' : 'file',
             size: stats.size,
             timestamp: Math.floor(stats.mtimeMs / 1000),
