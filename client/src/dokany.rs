@@ -601,7 +601,16 @@ where 'h: 'c
 }
 
 pub fn run_dokany_client(filesystem: RemoteFilesystem) {
-    let mount_point = "M:";
+    // On Windows, Dokan can mount to a drive root (e.g. "M:\\") or to an existing directory.
+    // The project expects to mount under the client's folder: mnt/remote-fs.
+    // Use an absolute path because relative mount points are unreliable.
+    let mount_point_path = std::env::current_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join("mnt")
+        .join("remote-fs");
+    let _ = std::fs::create_dir_all(&mount_point_path);
+
+    let mount_point = mount_point_path.to_string_lossy().to_string();
     println!("Mounting filesystem at {}", mount_point);
     
     dokan::init();
@@ -612,11 +621,17 @@ pub fn run_dokany_client(filesystem: RemoteFilesystem) {
     ctrlc::set_handler(move || {
         println!("\nReceived Ctrl+C, unmounting...");
         c.store(true, Ordering::SeqCst);
-        let mp = U16CString::from_str("M:").expect("Invalid mount point");
-        dokan::unmount(mp.as_ucstr());
+        // Recompute mount point on Ctrl+C (uses current working directory).
+        let mount_point_path = std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join("mnt")
+            .join("remote-fs");
+        let mp = U16CString::from_str(mount_point_path.to_string_lossy().as_ref())
+            .expect("Invalid mount point");
+        let _ = dokan::unmount(mp.as_ucstr());
     }).expect("Error setting Ctrl-C handler");
     
-    let mount_point_cstr = U16CString::from_str(mount_point).expect("Invalid mount point");
+    let mount_point_cstr = U16CString::from_str(&mount_point).expect("Invalid mount point");
     let options = MountOptions::default();
     
 
@@ -624,7 +639,26 @@ pub fn run_dokany_client(filesystem: RemoteFilesystem) {
     
     match mounter.mount() {
         Ok(_) => println!("Filesystem mounted successfully."),
-        Err(e) => eprintln!("Failed to mount: {:?}", e),
+        Err(e) => {
+            eprintln!("Failed to mount: {:?}", e);
+
+            // The most common cause on Windows is that the Dokan driver isn't installed
+            // (or cannot be installed/started due to missing admin rights / signature enforcement).
+            let err_text = format!("{:?}", e);
+            if err_text.contains("DriverInstall") {
+                eprintln!(
+                    "\nDokan driver install/start failed (DriverInstall).\n\
+Checks to do on Windows:\n\
+  1) Install the Dokan/Dokany driver (Dokan Library installer, x64).\n\
+  2) Reboot after installation (driver/service may not start until reboot).\n\
+  3) Run this client from an elevated (Administrator) terminal.\n\
+  4) If mounting to a directory, ensure the mount folder exists and is empty:\n\
+     {}\n\
+  5) If it still fails, Windows may be blocking the driver (signature policy / security software).\n",
+                    mount_point
+                );
+            }
+        }
     }
     
     if clicked.load(Ordering::SeqCst) {
