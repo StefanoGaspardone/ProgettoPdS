@@ -601,9 +601,6 @@ where 'h: 'c
 }
 
 pub fn run_dokany_client(filesystem: RemoteFilesystem) {
-    // On Windows, Dokan can mount to a drive root (e.g. "M:\\") or to an existing directory.
-    // The project expects to mount under the client's folder: mnt/remote-fs.
-    // Use an absolute path because relative mount points are unreliable.
     let mount_point_path = std::env::current_dir()
         .unwrap_or_else(|_| std::path::PathBuf::from("."))
         .join("mnt")
@@ -642,19 +639,17 @@ pub fn run_dokany_client(filesystem: RemoteFilesystem) {
         Err(e) => {
             eprintln!("Failed to mount: {:?}", e);
 
-            // The most common cause on Windows is that the Dokan driver isn't installed
-            // (or cannot be installed/started due to missing admin rights / signature enforcement).
             let err_text = format!("{:?}", e);
             if err_text.contains("DriverInstall") {
                 eprintln!(
                     "\nDokan driver install/start failed (DriverInstall).\n\
-Checks to do on Windows:\n\
-  1) Install the Dokan/Dokany driver (Dokan Library installer, x64).\n\
-  2) Reboot after installation (driver/service may not start until reboot).\n\
-  3) Run this client from an elevated (Administrator) terminal.\n\
-  4) If mounting to a directory, ensure the mount folder exists and is empty:\n\
-     {}\n\
-  5) If it still fails, Windows may be blocking the driver (signature policy / security software).\n",
+                    Checks to do on Windows:\n\
+                    1) Install the Dokan/Dokany driver (Dokan Library installer, x64).\n\
+                    2) Reboot after installation (driver/service may not start until reboot).\n\
+                    3) Run this client from an elevated (Administrator) terminal.\n\
+                    4) If mounting to a directory, ensure the mount folder exists and is empty:\n\
+                        {}\n\
+                    5) If it still fails, Windows may be blocking the driver (signature policy / security software).\n",
                     mount_point
                 );
             }
