@@ -161,6 +161,53 @@ where 'h: 'c
             _ => return Err(DOKAN_ERROR),
         }
 
+        // Windows redirection semantics:
+        // - `echo ... > file` typically opens with overwrite/truncate semantics.
+        // - `echo ... >> file` typically opens with append, and writes at end.
+        // Truncation is best handled here and in `set_end_of_file`.
+        let should_truncate_existing_file = matches!(
+            create_disposition,
+            FILE_OVERWRITE | FILE_OVERWRITE_IF | FILE_SUPERSEDE
+        ) && exists && !is_dir && !is_dir_request;
+
+        if should_truncate_existing_file {
+            let url = self
+                .server_url
+                .join(&format!("/truncate/{}", path))
+                .map_err(|_| DOKAN_ERROR)?;
+            let truncated = self.runtime.block_on(async {
+                let client = reqwest::Client::new();
+                let res = client
+                    .post(url)
+                    .json(&serde_json::json!({"size": 0}))
+                    .send()
+                    .await;
+                matches!(res, Ok(r) if r.status().is_success())
+            });
+
+            if truncated {
+                let stat_url = self
+                    .server_url
+                    .join(&format!("/stat/{}", path))
+                    .map_err(|_| DOKAN_ERROR)?;
+                let updated = self.runtime.block_on(async {
+                    let client = reqwest::Client::new();
+                    let res = client.get(stat_url).send().await;
+                    match res {
+                        Ok(r) if r.status().is_success() => r.json::<RemoteFileInfo>().await.ok(),
+                        _ => None,
+                    }
+                });
+
+                if let Some(info) = updated {
+                    let mut metadata_cache = self.metadata_cache.lock().unwrap();
+                    if let Some((ino, _)) = metadata_cache.get(&path).cloned() {
+                        metadata_cache.insert(path.clone(), (ino, info));
+                    }
+                }
+            }
+        }
+
         if is_dir_request {
             let url = self.server_url.join(&format!("/mkdir/{}", path)).map_err(|_| DOKAN_ERROR)?;
             let success = self.runtime.block_on(async {
@@ -283,7 +330,7 @@ where 'h: 'c
     fn write_file(
         &'h self,
         file_name: &U16CStr,
-        _offset: i64,
+        offset: i64,
         buffer: &[u8],
         _info: &OperationInfo<'c, 'h, Self>,
         _context: &'c Self::Context
@@ -293,22 +340,77 @@ where 'h: 'c
 
         println!("Writing file: {}", path);
         
-        let url = self.server_url.join(&format!("/files/{}", path)).map_err(|_| DOKAN_ERROR)?;
-        
-        let success = self.runtime.block_on(async {
+        // Dokan provides an explicit offset. For append-style handles, Dokan may pass -1.
+        let effective_offset = if offset >= 0 {
+            offset
+        } else {
+            // Fallback: compute end-of-file for append.
+            let cached_size = {
+                let metadata_cache = self.metadata_cache.lock().unwrap();
+                metadata_cache.get(&path).map(|(_, info)| info.size as i64)
+            };
+
+            if let Some(size) = cached_size {
+                size
+            } else {
+                let stat_url = self
+                    .server_url
+                    .join(&format!("/stat/{}", path))
+                    .map_err(|_| DOKAN_ERROR)?;
+                let info = self.runtime.block_on(async {
+                    let client = reqwest::Client::new();
+                    let res = client.get(stat_url).send().await;
+                    match res {
+                        Ok(r) if r.status().is_success() => r.json::<RemoteFileInfo>().await.ok(),
+                        _ => None,
+                    }
+                });
+                info.map(|i| i.size as i64).unwrap_or(0)
+            }
+        };
+
+        let url = self
+            .server_url
+            .join(&format!("/files/{}?offset={}", path, effective_offset))
+            .map_err(|_| DOKAN_ERROR)?;
+
+        let status = self.runtime.block_on(async {
             let client = reqwest::Client::new();
-            let res = client.put(url)
+            let res = client
+                .put(url)
                 .header("Content-Type", "application/octet-stream")
                 .body(buffer.to_vec())
                 .send()
                 .await;
-            matches!(res, Ok(r) if r.status().is_success())
+            res.ok().map(|r| r.status())
         });
 
-        if success {
-             Ok(buffer.len() as u32)
-        } else {
-             Err(DOKAN_ERROR)
+        match status {
+            Some(s) if s.is_success() => {
+                // Refresh metadata cache for size/timestamp.
+                let stat_url = self
+                    .server_url
+                    .join(&format!("/stat/{}", path))
+                    .map_err(|_| DOKAN_ERROR)?;
+                let updated = self.runtime.block_on(async {
+                    let client = reqwest::Client::new();
+                    let res = client.get(stat_url).send().await;
+                    match res {
+                        Ok(r) if r.status().is_success() => r.json::<RemoteFileInfo>().await.ok(),
+                        _ => None,
+                    }
+                });
+
+                if let Some(info) = updated {
+                    let mut metadata_cache = self.metadata_cache.lock().unwrap();
+                    if let Some((ino, _)) = metadata_cache.get(&path).cloned() {
+                        metadata_cache.insert(path.clone(), (ino, info));
+                    }
+                }
+
+                Ok(buffer.len() as u32)
+            }
+            _ => Err(DOKAN_ERROR),
         }
     }
 
@@ -496,12 +598,57 @@ where 'h: 'c
 
     fn set_end_of_file(
         &'h self,
-        _file_name: &U16CStr,
-        _offset: i64,
+        file_name: &U16CStr,
+        offset: i64,
         _info: &OperationInfo<'c, 'h, Self>,
         _context: &'c Self::Context
     ) -> Result<(), i32> {
-        Ok(())
+        if offset < 0 {
+            return Ok(());
+        }
+
+        let path_str = file_name.to_string_lossy();
+        let path = normalize_path(&path_str);
+
+        let url = self
+            .server_url
+            .join(&format!("/truncate/{}", path))
+            .map_err(|_| DOKAN_ERROR)?;
+        let truncated = self.runtime.block_on(async {
+            let client = reqwest::Client::new();
+            let res = client
+                .post(url)
+                .json(&serde_json::json!({"size": offset}))
+                .send()
+                .await;
+            matches!(res, Ok(r) if r.status().is_success())
+        });
+
+        if truncated {
+            let stat_url = self
+                .server_url
+                .join(&format!("/stat/{}", path))
+                .map_err(|_| DOKAN_ERROR)?;
+            let updated = self.runtime.block_on(async {
+                let client = reqwest::Client::new();
+                let res = client.get(stat_url).send().await;
+                match res {
+                    Ok(r) if r.status().is_success() => r.json::<RemoteFileInfo>().await.ok(),
+                    _ => None,
+                }
+            });
+
+            if let Some(info) = updated {
+                let mut metadata_cache = self.metadata_cache.lock().unwrap();
+                if let Some((ino, _)) = metadata_cache.get(&path).cloned() {
+                    metadata_cache.insert(path.clone(), (ino, info));
+                }
+            }
+
+            Ok(())
+        } else {
+            Err(DOKAN_ERROR)
+        }
     }
 
     fn set_allocation_size(
