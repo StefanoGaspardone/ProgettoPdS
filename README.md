@@ -35,6 +35,9 @@ make sure "build-essential", "pkg-config", "libssl-dev", "libfuse3-dev", "libfus
 - DOKAN - Windows  
 make sure "Dokan Library" is installed
 
+- macFUSE - MacOS  
+make sure "macFUSE" is installed
+
 -----
 
 make sure to delete all files inside client/mnt/remote-fs before running the client

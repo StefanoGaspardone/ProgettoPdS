@@ -1,4 +1,4 @@
-use fuser::{Filesystem, mount2, Request, ReplyAttr, ReplyData, ReplyDirectory, FileAttr, FileType, ReplyEmpty};
+use fuser::{Filesystem, mount2, Request, ReplyAttr, ReplyData, ReplyDirectory, FileAttr, FileType, ReplyEmpty, MountOption};
 use libc::{EEXIST, EINVAL, ENOENT, EIO};
 use std::ffi::{OsStr, OsString};
 use std::{process, thread};
@@ -13,6 +13,7 @@ const TTL: Duration = Duration::from_secs(1);
 
 impl Filesystem for RemoteFilesystem {
     fn open(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: fuser::ReplyOpen) {
+        println!("FUSE: open ino={}", ino);
         reply.opened(ino, 0);
     }
 
@@ -139,6 +140,7 @@ impl Filesystem for RemoteFilesystem {
     }
 
     fn create(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, _mode: u32, _umask: u32, _flags: i32, reply: fuser::ReplyCreate) {
+        println!("FUSE: create parent={} name={}", parent, name.to_string_lossy());
         let parent_path = {
             let inode_cache = self.inode_cache.lock().unwrap();
             if let Some(p) = inode_cache.get(&parent) {
@@ -241,6 +243,7 @@ impl Filesystem for RemoteFilesystem {
     }
 
     fn lookup(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: fuser::ReplyEntry) {
+        println!("FUSE: lookup parent={} name={}", parent, name.to_string_lossy());
         let parent_path = {
             let inode_cache = self.inode_cache.lock().unwrap();
             if let Some(p) = inode_cache.get(&parent) {
@@ -328,6 +331,7 @@ impl Filesystem for RemoteFilesystem {
     }
 
     fn getattr(&mut self, req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
+        println!("FUSE: getattr ino={}", ino);
         if ino == FUSE_ROOT_ID {
             let attr = FileAttr {
                 ino: FUSE_ROOT_ID,
@@ -393,7 +397,7 @@ impl Filesystem for RemoteFilesystem {
     }
 
     fn readdir(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
-        println!("Performing read dir");
+        println!("FUSE: readdir ino={} offset={}", ino, offset);
 		
 		let mut entries = vec![
             (FUSE_ROOT_ID, FileType::Directory, OsString::from(".")),
@@ -457,7 +461,7 @@ impl Filesystem for RemoteFilesystem {
     }
 
     fn read(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, offset: i64, size: u32, _flags: i32, _lock_owner: Option<u64>, reply: ReplyData) {
-        println!("Performing read");
+        println!("FUSE: read ino={} offset={} size={}", ino, offset, size);
         
         let path = {
             let inode_cache = self.inode_cache.lock().unwrap();
@@ -500,7 +504,7 @@ impl Filesystem for RemoteFilesystem {
     }
 
     fn write(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, offset: i64, data: &[u8], _write_flags: u32, _flags: i32, _lock_owner: Option<u64>, reply: fuser::ReplyWrite) {
-        println!("Performing write");
+        println!("FUSE: write ino={} offset={} len={}", ino, offset, data.len());
         
         let path = {
             let inode_cache = self.inode_cache.lock().unwrap();
@@ -564,7 +568,7 @@ impl Filesystem for RemoteFilesystem {
     }
 
     fn mkdir(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, _mode: u32, _umask: u32, reply: fuser::ReplyEntry) {
-        println!("Performing mkdir");
+        println!("FUSE: mkdir parent={} name={}", parent, name.to_string_lossy());
         
         let parent_path = {
             let inode_cache = self.inode_cache.lock().unwrap();
@@ -653,7 +657,7 @@ impl Filesystem for RemoteFilesystem {
     }
 
     fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        println!("Performing rmdir (file)");
+        println!("FUSE: unlink parent={} name={}", parent, name.to_string_lossy());
         
         let mut inode_cache = self.inode_cache.lock().unwrap();
         let parent_path = if let Some(p) = inode_cache.get(&parent) {
@@ -694,7 +698,7 @@ impl Filesystem for RemoteFilesystem {
     }
 
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        println!("Performing rmdir (dir)");
+        println!("FUSE: rmdir parent={} name={}", parent, name.to_string_lossy());
         
         let mut inode_cache = self.inode_cache.lock().unwrap();
         let parent_path = if let Some(p) = inode_cache.get(&parent) {
@@ -735,7 +739,7 @@ impl Filesystem for RemoteFilesystem {
     }
 
     fn rename(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, newparent: u64, newname: &OsStr, _flags: u32, reply: ReplyEmpty) {
-        println!("Performing rename");
+        println!("FUSE: rename parent={} name={} -> newparent={} newname={}", parent, name.to_string_lossy(), newparent, newname.to_string_lossy());
 
         let old_name = match name.to_str() {
             Some(s) => s,
@@ -865,7 +869,11 @@ pub fn run_fuser_client(filesystem: RemoteFilesystem) {
     }).expect("Error setting Ctrl-C handler");
 
     let handle = thread::spawn(move || {
-        let res = mount2(filesystem, mountpoint, &[]);
+        let opts: [MountOption; 0] = [];
+
+        println!("Mounting with options: {:?}", opts);
+
+        let res = mount2(filesystem, mountpoint, &opts);
         if let Err(err) = res {
             println!("Error while mounting the filesystem: {}", err);
             process::exit(1);
