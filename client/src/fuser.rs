@@ -1,5 +1,5 @@
 use fuser::{Filesystem, mount2, Request, ReplyAttr, ReplyData, ReplyDirectory, FileAttr, FileType, ReplyEmpty};
-use libc::{EEXIST, ENOENT, EIO};
+use libc::{EEXIST, EINVAL, ENOENT, EIO};
 use std::ffi::{OsStr, OsString};
 use std::{process, thread};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,7 +13,6 @@ const TTL: Duration = Duration::from_secs(1);
 
 impl Filesystem for RemoteFilesystem {
     fn open(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: fuser::ReplyOpen) {
-        // Restituisci semplicemente il file handle uguale all'inode
         reply.opened(ino, 0);
     }
 
@@ -28,20 +27,71 @@ impl Filesystem for RemoteFilesystem {
             }
         };
 
-        // Support shell redirection '>' which truncates via setattr(size=0)
         if let Some(new_size) = size {
             let url = self.server_url.join(&format!("/truncate/{}", path)).unwrap();
             let res = self.runtime.block_on(async {
                 let client = reqwest::Client::new();
-                let res = client.post(url).json(&serde_json::json!({"size": new_size as i64})).send().await.map_err(|_| EIO)?;
+                let res = client
+                    .post(url)
+                    .json(&serde_json::json!({"size": new_size as i64}))
+                    .send()
+                    .await
+                    .map_err(|_| EIO)?;
                 Ok::<_, i32>(res.status())
             });
 
             match res {
                 Ok(status) if status.is_success() => {}
+                // Some shells trigger truncate before any write; if the file doesn't exist yet,
+                // create an empty file first and retry.
                 Ok(status) if status.as_u16() == 404 => {
-                    reply.error(ENOENT);
-                    return;
+                    let create_url = self
+                        .server_url
+                        .join(&format!("/files/{}?offset=0", path))
+                        .unwrap();
+                    let create_status = self.runtime.block_on(async {
+                        let client = reqwest::Client::new();
+                        let res = client
+                            .put(create_url)
+                            .header("Content-Type", "application/octet-stream")
+                            .body(Vec::<u8>::new())
+                            .send()
+                            .await
+                            .map_err(|_| EIO)?;
+                        Ok::<_, i32>(res.status())
+                    });
+
+                    match create_status {
+                        Ok(s) if s.is_success() => {}
+                        _ => {
+                            reply.error(ENOENT);
+                            return;
+                        }
+                    }
+
+                    let retry_url = self.server_url.join(&format!("/truncate/{}", path)).unwrap();
+                    let retry = self.runtime.block_on(async {
+                        let client = reqwest::Client::new();
+                        let res = client
+                            .post(retry_url)
+                            .json(&serde_json::json!({"size": new_size as i64}))
+                            .send()
+                            .await
+                            .map_err(|_| EIO)?;
+                        Ok::<_, i32>(res.status())
+                    });
+
+                    match retry {
+                        Ok(s) if s.is_success() => {}
+                        Ok(s) if s.as_u16() == 404 => {
+                            reply.error(ENOENT);
+                            return;
+                        }
+                        _ => {
+                            reply.error(EIO);
+                            return;
+                        }
+                    }
                 }
                 _ => {
                     reply.error(EIO);
@@ -88,7 +138,7 @@ impl Filesystem for RemoteFilesystem {
         }
     }
 
-    fn create(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, mode: u32, _umask: u32, _flags: i32, reply: fuser::ReplyCreate) {
+    fn create(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, _mode: u32, _umask: u32, _flags: i32, reply: fuser::ReplyCreate) {
         let parent_path = {
             let inode_cache = self.inode_cache.lock().unwrap();
             if let Some(p) = inode_cache.get(&parent) {
@@ -106,7 +156,54 @@ impl Filesystem for RemoteFilesystem {
             format!("{}/{}", parent_path, file_name)
         };
 
-        let (ino, now) = {
+        let create_url = self
+            .server_url
+            .join(&format!("/files/{}?offset=0", path))
+            .unwrap();
+        let create_status = self.runtime.block_on(async {
+            let client = reqwest::Client::new();
+            let res = client
+                .put(create_url)
+                .header("Content-Type", "application/octet-stream")
+                .body(Vec::<u8>::new())
+                .send()
+                .await
+                .map_err(|_| EIO)?;
+            Ok::<_, i32>(res.status())
+        });
+
+        match create_status {
+            Ok(s) if s.is_success() => {}
+            Ok(s) if s.as_u16() == 409 => {
+                reply.error(EEXIST);
+                return;
+            }
+            _ => {
+                reply.error(EIO);
+                return;
+            }
+        }
+
+        let stat_url = self.server_url.join(&format!("/stat/{}", path)).unwrap();
+        let file_info: FileInfo = match self.runtime.block_on(async {
+            let client = reqwest::Client::new();
+            let res = client.get(stat_url).send().await.map_err(|_| EIO)?;
+            if res.status().as_u16() == 404 {
+                return Err(ENOENT);
+            }
+            if !res.status().is_success() {
+                return Err(EIO);
+            }
+            res.json().await.map_err(|_| EIO)
+        }) {
+            Ok(info) => info,
+            Err(errno) => {
+                reply.error(errno);
+                return;
+            }
+        };
+
+        let (ino, timestamp) = {
             let mut inode_cache = self.inode_cache.lock().unwrap();
             let mut metadata_cache = self.metadata_cache.lock().unwrap();
             let mut next_inode = self.next_inode.lock().unwrap();
@@ -114,31 +211,24 @@ impl Filesystem for RemoteFilesystem {
             let ino = *next_inode;
             *next_inode += 1;
 
-            let now = SystemTime::now();
-            let file_info = FileInfo {
-                name: file_name.to_string(),
-                path: path.clone(),
-                file_type: "file".to_string(),
-                size: 0,
-                timestamp: now.duration_since(UNIX_EPOCH).unwrap().as_secs(),
-                permissions: format!("{:o}", mode),
-            };
-
-            metadata_cache.insert(path.clone(), (ino, file_info));
+            metadata_cache.insert(path.clone(), (ino, file_info.clone()));
             inode_cache.insert(ino, path.clone());
 
-            (ino, now)
+            (ino, file_info.timestamp)
         };
+
+        let ts = UNIX_EPOCH + Duration::from_secs(timestamp);
+        let perm = parse_permissions(&file_info.permissions);
         let attr = FileAttr {
             ino,
-            size: 0,
-            blocks: 0,
-            atime: now,
-            mtime: now,
-            ctime: now,
-            crtime: now,
+            size: file_info.size as u64,
+            blocks: (file_info.size as u64 + 511) / 512,
+            atime: ts,
+            mtime: ts,
+            ctime: ts,
+            crtime: ts,
             kind: FileType::RegularFile,
-            perm: mode as u16,
+            perm,
             nlink: 1,
             uid: req.uid(),
             gid: req.gid(),
@@ -473,7 +563,7 @@ impl Filesystem for RemoteFilesystem {
         }
     }
 
-    fn mkdir(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, mode: u32, _umask: u32, reply: fuser::ReplyEntry) {
+    fn mkdir(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, _mode: u32, _umask: u32, reply: fuser::ReplyEntry) {
         println!("Performing mkdir");
         
         let parent_path = {
@@ -501,7 +591,26 @@ impl Filesystem for RemoteFilesystem {
         });
 
         if res.is_success() {
-            let (ino, now) = {
+            let stat_url = self.server_url.join(&format!("/stat/{}", path)).unwrap();
+            let file_info: FileInfo = match self.runtime.block_on(async {
+                let client = reqwest::Client::new();
+                let res = client.get(stat_url).send().await.map_err(|_| EIO)?;
+                if res.status().as_u16() == 404 {
+                    return Err(ENOENT);
+                }
+                if !res.status().is_success() {
+                    return Err(EIO);
+                }
+                res.json().await.map_err(|_| EIO)
+            }) {
+                Ok(info) => info,
+                Err(errno) => {
+                    reply.error(errno);
+                    return;
+                }
+            };
+
+            let (ino, timestamp) = {
                 let mut inode_cache = self.inode_cache.lock().unwrap();
                 let mut metadata_cache = self.metadata_cache.lock().unwrap();
                 let mut next_inode = self.next_inode.lock().unwrap();
@@ -509,31 +618,24 @@ impl Filesystem for RemoteFilesystem {
                 let ino = *next_inode;
                 *next_inode += 1;
 
-                let now = SystemTime::now();
-                let file_info = FileInfo {
-                    name: dir_name.to_string(),
-                    path: path.clone(),
-                    file_type: "dir".to_string(),
-                    size: 0,
-                    timestamp: now.duration_since(UNIX_EPOCH).unwrap().as_secs(),
-                    permissions: format!("{:o}", mode),
-                };
-                metadata_cache.insert(path.clone(), (ino, file_info));
+                metadata_cache.insert(path.clone(), (ino, file_info.clone()));
                 inode_cache.insert(ino, path.clone());
 
-                (ino, now)
+                (ino, file_info.timestamp)
             };
 
+            let ts = UNIX_EPOCH + Duration::from_secs(timestamp);
+            let perm = parse_permissions(&file_info.permissions);
             let attr = FileAttr {
                 ino,
-                size: 0,
-                blocks: 0,
-                atime: now,
-                mtime: now,
-                ctime: now,
-                crtime: now,
+                size: file_info.size as u64,
+                blocks: (file_info.size as u64 + 511) / 512,
+                atime: ts,
+                mtime: ts,
+                ctime: ts,
+                crtime: ts,
                 kind: FileType::Directory,
-                perm: mode as u16,
+                perm,
                 nlink: 2,
                 uid: req.uid(),
                 gid: req.gid(),
@@ -541,7 +643,7 @@ impl Filesystem for RemoteFilesystem {
                 flags: 0,
                 blksize: 512,
             };
-            
+
             reply.entry(&TTL, &attr, 0);
         } else if res.as_u16() == 409 {
             reply.error(EEXIST);
@@ -630,6 +732,123 @@ impl Filesystem for RemoteFilesystem {
         } else {
             reply.error(EIO);
         }
+    }
+
+    fn rename(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, newparent: u64, newname: &OsStr, _flags: u32, reply: ReplyEmpty) {
+        println!("Performing rename");
+
+        let old_name = match name.to_str() {
+            Some(s) => s,
+            None => {
+                reply.error(EINVAL);
+                return;
+            }
+        };
+        let new_name = match newname.to_str() {
+            Some(s) => s,
+            None => {
+                reply.error(EINVAL);
+                return;
+            }
+        };
+
+        let (parent_path, new_parent_path) = {
+            let inode_cache = self.inode_cache.lock().unwrap();
+            let parent_path = if let Some(p) = inode_cache.get(&parent) {
+                p.clone()
+            } else {
+                reply.error(ENOENT);
+                return;
+            };
+            let new_parent_path = if let Some(p) = inode_cache.get(&newparent) {
+                p.clone()
+            } else {
+                reply.error(ENOENT);
+                return;
+            };
+            (parent_path, new_parent_path)
+        };
+
+        let old_path = if parent_path.is_empty() || parent_path == "/" {
+            old_name.to_string()
+        } else {
+            format!("{}/{}", parent_path, old_name)
+        };
+
+        let new_path = if new_parent_path.is_empty() || new_parent_path == "/" {
+            new_name.to_string()
+        } else {
+            format!("{}/{}", new_parent_path, new_name)
+        };
+
+        let url = self.server_url.join("/rename").unwrap();
+        let status = match self.runtime.block_on(async {
+            let client = reqwest::Client::new();
+            let res = client
+                .post(url)
+                .json(&serde_json::json!({"from": old_path, "to": new_path}))
+                .send()
+                .await
+                .map_err(|_| EIO)?;
+            Ok::<_, i32>(res.status())
+        }) {
+            Ok(s) => s,
+            Err(errno) => {
+                reply.error(errno);
+                return;
+            }
+        };
+
+        if !status.is_success() {
+            match status.as_u16() {
+                400 => reply.error(EINVAL),
+                404 => reply.error(ENOENT),
+                409 => reply.error(EEXIST),
+                _ => reply.error(EIO),
+            }
+            return;
+        }
+
+        let mut inode_cache = self.inode_cache.lock().unwrap();
+        let mut metadata_cache = self.metadata_cache.lock().unwrap();
+
+        let old_prefix = format!("{}/", old_path);
+        let new_prefix = format!("{}/", new_path);
+
+        let keys: Vec<String> = metadata_cache.keys().cloned().collect();
+        for key in keys {
+            if key == old_path || key.starts_with(&old_prefix) {
+                let new_key = if key == old_path {
+                    new_path.clone()
+                } else {
+                    let rest = &key[old_prefix.len()..];
+                    format!("{}{}", new_prefix, rest)
+                };
+
+                if let Some((ino, mut info)) = metadata_cache.remove(&key) {
+                    info.path = new_key.clone();
+                    info.name = new_key
+                        .split('/')
+                        .last()
+                        .unwrap_or("")
+                        .to_string();
+                    let updated_path = info.path.clone();
+                    metadata_cache.insert(new_key, (ino, info));
+                    inode_cache.insert(ino, updated_path);
+                }
+            }
+        }
+
+        for(_ino, p) in inode_cache.iter_mut() {
+            if *p == old_path {
+                *p = new_path.clone();
+            } else if p.starts_with(&old_prefix) {
+                let rest = &p[old_prefix.len()..];
+                *p = format!("{}{}", new_prefix, rest);
+            }
+        }
+
+        reply.ok();
     }
 }
 

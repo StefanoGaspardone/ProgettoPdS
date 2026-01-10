@@ -52,6 +52,28 @@ const resolveUnderRemoteRoot = (pathParts) => {
     return { relativePath, fullPath };
 };
 
+const resolveUnderRemoteRootFromString = (rawPath) => {
+    if (typeof rawPath !== 'string') {
+        throw new Error('Invalid path');
+    }
+
+    const forwardSlashes = rawPath.replaceAll('\\', '/');
+    const noLeadingSlashes = forwardSlashes.replace(/^\/+/, '');
+    const normalized = path.posix.normalize(noLeadingSlashes);
+    const relativePath = normalized === '.' ? '' : normalized;
+
+    if (relativePath.startsWith('..') || relativePath.includes('/../')) {
+        throw new Error('Invalid path');
+    }
+
+    const fullPath = path.resolve(REMOTE_FS_ROOT, relativePath);
+    if (fullPath !== REMOTE_FS_ROOT && !fullPath.startsWith(REMOTE_FS_ROOT + path.sep)) {
+        throw new Error('Invalid path');
+    }
+
+    return { relativePath, fullPath };
+};
+
 const getPermissionsString = (mode, isDirectory) => {
     const isOwnerRead = (mode & fs.constants.S_IRUSR) !== 0;
     const isOwnerWrite = (mode & fs.constants.S_IWUSR) !== 0;
@@ -132,6 +154,8 @@ app.get('/files{/*path}', async (req, res) => {
 app.put('/files{/*path}', express.raw({ type: '*/*', limit: '50mb' }), async (req, res) => {
     try {
         const data = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+
+        console.log(req.params);
         
         const { relativePath: filePath, fullPath } = resolveUnderRemoteRoot(req.params.path);
         const offset = Number.isFinite(Number(req.query.offset)) ? Number(req.query.offset) : 0;
@@ -160,22 +184,42 @@ app.put('/files{/*path}', express.raw({ type: '*/*', limit: '50mb' }), async (re
     }
 });
 
-// Truncate file to a specific size (used by FUSE setattr(size=...))
+// Truncate file to a specific size
 app.post('/truncate{/*path}', async (req, res) => {
     try {
         const { relativePath: filePath, fullPath } = resolveUnderRemoteRoot(req.params.path);
         const size = req.body?.size;
 
-        if (!Number.isInteger(size) || size < 0) {
-            return res.status(400).json({ success: false, message: 'Invalid size' });
-        }
+        if(!Number.isInteger(size) || size < 0) return res.status(400).json({ success: false, message: 'Invalid size' });
 
         if(!await pathExists(fullPath)) return res.status(404).json({ success: false, message: `Path "${filePath}" does not exist` });
         if((await fs.promises.stat(fullPath)).isDirectory()) return res.status(400).json({ success: false, message: `Path "${filePath}" does not correspond to a file` });
 
         await fs.promises.truncate(fullPath, size);
         return res.status(200).end();
-    } catch (error) {
+    } catch(error) {
+        console.log(error);
+        return res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// Rename and move a file / dir
+app.post('/rename', async (req, res) => {
+    try {
+        const from = req.body?.from;
+        const to = req.body?.to;
+
+        const { relativePath: fromPath, fullPath: fromFullPath } = resolveUnderRemoteRootFromString(from);
+        const { relativePath: toPath, fullPath: toFullPath } = resolveUnderRemoteRootFromString(to);
+
+        if(fromPath === '' || toPath === '') return res.status(400).json({ success: false, message: 'Invalid path' });
+        if(!await pathExists(fromFullPath)) return res.status(404).json({ success: false, message: `Path "${fromPath}" does not exist` });
+
+        await fs.promises.mkdir(path.dirname(toFullPath), { recursive: true });
+
+        await fs.promises.rename(fromFullPath, toFullPath);
+        return res.status(200).end();
+    } catch(error) {
         console.log(error);
         return res.status(500).json({ success: false, message: error.message });
     }
