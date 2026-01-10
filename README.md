@@ -8,6 +8,9 @@ npm run dev
 FUSE - Linux
 make sure "build-essential", "pkg-config", "libssl-dev", "libfuse3-dev", "libfuse-dev" are installed
 
+- if errors run: fusermount3 -uz client/mnt/remote-fs || fusermount -uz client/mnt/remote-fs || sudo umount -l client/mnt/remote-fs
+- quando si fa ctrl+c per fermare il client, assicurarsi di chiudere prima il terminale in cui si è dentro al file system
+
 DOKAN - Windows
 make sure "Dokan Library" is installed
 

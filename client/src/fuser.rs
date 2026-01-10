@@ -1,5 +1,5 @@
 use fuser::{Filesystem, mount2, Request, ReplyAttr, ReplyData, ReplyDirectory, FileAttr, FileType, ReplyEmpty};
-use libc::{ENOENT, EIO};
+use libc::{EEXIST, ENOENT, EIO};
 use std::ffi::{OsStr, OsString};
 use std::{process, thread};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,16 +17,40 @@ impl Filesystem for RemoteFilesystem {
         reply.opened(ino, 0);
     }
 
-    fn setattr(&mut self, _req: &Request<'_>, ino: u64, mode: Option<u32>, _uid: Option<u32>, _gid: Option<u32>, size: Option<u64>, _atime: Option<fuser::TimeOrNow>, _mtime: Option<fuser::TimeOrNow>, _ctime: Option<SystemTime>, _fh: Option<u64>, _crtime: Option<SystemTime>, _chgtime: Option<SystemTime>, _bkuptime: Option<SystemTime>, _flags: Option<u32>, reply: ReplyAttr,) {
-        let mut metadata_cache = self.metadata_cache.lock().unwrap();
-        let inode_cache = self.inode_cache.lock().unwrap();
-        
-		let path = if let Some(p) = inode_cache.get(&ino) {
-            p.clone()
-        } else {
-            reply.error(ENOENT);
-            return;
+    fn setattr(&mut self, req: &Request<'_>, ino: u64, mode: Option<u32>, _uid: Option<u32>, _gid: Option<u32>, size: Option<u64>, _atime: Option<fuser::TimeOrNow>, _mtime: Option<fuser::TimeOrNow>, _ctime: Option<SystemTime>, _fh: Option<u64>, _crtime: Option<SystemTime>, _chgtime: Option<SystemTime>, _bkuptime: Option<SystemTime>, _flags: Option<u32>, reply: ReplyAttr,) {
+        let path = {
+            let inode_cache = self.inode_cache.lock().unwrap();
+            if let Some(p) = inode_cache.get(&ino) {
+                p.clone()
+            } else {
+                reply.error(ENOENT);
+                return;
+            }
         };
+
+        // Support shell redirection '>' which truncates via setattr(size=0)
+        if let Some(new_size) = size {
+            let url = self.server_url.join(&format!("/truncate/{}", path)).unwrap();
+            let res = self.runtime.block_on(async {
+                let client = reqwest::Client::new();
+                let res = client.post(url).json(&serde_json::json!({"size": new_size as i64})).send().await.map_err(|_| EIO)?;
+                Ok::<_, i32>(res.status())
+            });
+
+            match res {
+                Ok(status) if status.is_success() => {}
+                Ok(status) if status.as_u16() == 404 => {
+                    reply.error(ENOENT);
+                    return;
+                }
+                _ => {
+                    reply.error(EIO);
+                    return;
+                }
+            }
+        }
+
+        let mut metadata_cache = self.metadata_cache.lock().unwrap();
 
         if let Some((_, file_info)) = metadata_cache.get_mut(&path) {
             if let Some(new_size) = size {
@@ -51,8 +75,8 @@ impl Filesystem for RemoteFilesystem {
                 kind: if file_info.file_type == "dir" { FileType::Directory } else { FileType::RegularFile },
                 perm,
                 nlink: 1,
-                uid: 0,
-                gid: 0,
+                uid: req.uid(),
+                gid: req.gid(),
                 rdev: 0,
                 flags: 0,
                 blksize: 512,
@@ -64,13 +88,15 @@ impl Filesystem for RemoteFilesystem {
         }
     }
 
-    fn create(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, mode: u32, _umask: u32, _flags: i32, reply: fuser::ReplyCreate) {
-        let inode_cache = self.inode_cache.lock().unwrap();
-        let parent_path = if let Some(p) = inode_cache.get(&parent) {
-            p.clone()
-        } else {
-            reply.error(ENOENT);
-            return;
+    fn create(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, mode: u32, _umask: u32, _flags: i32, reply: fuser::ReplyCreate) {
+        let parent_path = {
+            let inode_cache = self.inode_cache.lock().unwrap();
+            if let Some(p) = inode_cache.get(&parent) {
+                p.clone()
+            } else {
+                reply.error(ENOENT);
+                return;
+            }
         };
 
         let file_name = name.to_str().unwrap();
@@ -80,14 +106,29 @@ impl Filesystem for RemoteFilesystem {
             format!("{}/{}", parent_path, file_name)
         };
 
-        let ino = {
+        let (ino, now) = {
+            let mut inode_cache = self.inode_cache.lock().unwrap();
+            let mut metadata_cache = self.metadata_cache.lock().unwrap();
             let mut next_inode = self.next_inode.lock().unwrap();
-            let val = *next_inode;
-            *next_inode += 1;
-            val
-        };
 
-        let now = SystemTime::now();
+            let ino = *next_inode;
+            *next_inode += 1;
+
+            let now = SystemTime::now();
+            let file_info = FileInfo {
+                name: file_name.to_string(),
+                path: path.clone(),
+                file_type: "file".to_string(),
+                size: 0,
+                timestamp: now.duration_since(UNIX_EPOCH).unwrap().as_secs(),
+                permissions: format!("{:o}", mode),
+            };
+
+            metadata_cache.insert(path.clone(), (ino, file_info));
+            inode_cache.insert(ino, path.clone());
+
+            (ino, now)
+        };
         let attr = FileAttr {
             ino,
             size: 0,
@@ -99,38 +140,25 @@ impl Filesystem for RemoteFilesystem {
             kind: FileType::RegularFile,
             perm: mode as u16,
             nlink: 1,
-            uid: 0,
-            gid: 0,
+            uid: req.uid(),
+            gid: req.gid(),
             rdev: 0,
             flags: 0,
             blksize: 512,
         };
 
-        let mut metadata_cache = self.metadata_cache.lock().unwrap();
-        let mut inode_cache = self.inode_cache.lock().unwrap();
-        
-        let file_info = FileInfo {
-            name: file_name.to_string(),
-            path: path.clone(),
-            file_type: "file".to_string(),
-            size: 0,
-            timestamp: now.duration_since(UNIX_EPOCH).unwrap().as_secs(),
-            permissions: format!("{:o}", mode),
-        };
-
-        metadata_cache.insert(path.clone(), (ino, file_info));
-        inode_cache.insert(ino, path.clone());
-		
-		reply.created(&TTL, &attr, ino, 0, 0);
+		reply.created(&TTL, &attr, 0, ino, 0);
     }
 
-    fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: fuser::ReplyEntry) {
-        let inode_cache = self.inode_cache.lock().unwrap();
-        let parent_path = if let Some(p) = inode_cache.get(&parent) {
-            p.clone()
-        } else {
-            reply.error(ENOENT);
-            return;
+    fn lookup(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: fuser::ReplyEntry) {
+        let parent_path = {
+            let inode_cache = self.inode_cache.lock().unwrap();
+            if let Some(p) = inode_cache.get(&parent) {
+                p.clone()
+            } else {
+                reply.error(ENOENT);
+                return;
+            }
         };
 
         let file_name = name.to_str().unwrap();
@@ -140,34 +168,45 @@ impl Filesystem for RemoteFilesystem {
             format!("{}/{}", parent_path, file_name)
         };
 
-        let mut metadata_cache = self.metadata_cache.lock().unwrap();
-        let (ino, file_info) = if let Some((ino, info)) = metadata_cache.get(&path) {
-            (*ino, info.clone())
+        let cached = {
+            let metadata_cache = self.metadata_cache.lock().unwrap();
+            metadata_cache.get(&path).cloned()
+        };
+
+        let (ino, file_info) = if let Some((ino, info)) = cached {
+            (ino, info)
         } else {
             let url = self.server_url.join(&format!("/stat/{}", path)).unwrap();
             let file_info: FileInfo = match self.runtime.block_on(async {
                 let client = reqwest::Client::new();
-                let res = client.get(url).send().await?;
-                res.json().await
+                let res = client.get(url).send().await.map_err(|_| EIO)?;
+                if res.status().as_u16() == 404 {
+                    return Err(ENOENT);
+                }
+                if !res.status().is_success() {
+                    return Err(EIO);
+                }
+                res.json().await.map_err(|_| EIO)
             }) {
                 Ok(info) => info,
-                Err(_) => {
-                    reply.error(ENOENT);
+                Err(errno) => {
+                    reply.error(errno);
                     return;
                 }
             };
 
             let new_inode = {
+                let mut inode_cache = self.inode_cache.lock().unwrap();
+                let mut metadata_cache = self.metadata_cache.lock().unwrap();
                 let mut next_inode = self.next_inode.lock().unwrap();
-                let val = *next_inode;
-                *next_inode += 1;
-                val
-            };
 
-            metadata_cache.insert(path.clone(), (new_inode, file_info.clone()));
-            
-            let mut inode_cache = self.inode_cache.lock().unwrap();
-            inode_cache.insert(new_inode, path.clone());
+                let new_inode = *next_inode;
+                *next_inode += 1;
+
+                metadata_cache.insert(path.clone(), (new_inode, file_info.clone()));
+                inode_cache.insert(new_inode, path.clone());
+                new_inode
+            };
 
             (new_inode, file_info)
         };
@@ -188,8 +227,8 @@ impl Filesystem for RemoteFilesystem {
             kind,
             perm,
             nlink: 1,
-            uid: 0,
-            gid: 0,
+            uid: req.uid(),
+            gid: req.gid(),
             rdev: 0,
             flags: 0,
             blksize: 512,
@@ -198,7 +237,7 @@ impl Filesystem for RemoteFilesystem {
         reply.entry(&TTL, &attr, 0);
     }
 
-    fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
+    fn getattr(&mut self, req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         if ino == FUSE_ROOT_ID {
             let attr = FileAttr {
                 ino: FUSE_ROOT_ID,
@@ -211,8 +250,8 @@ impl Filesystem for RemoteFilesystem {
                 kind: FileType::Directory,
                 perm: 0o755,
                 nlink: 2,
-                uid: 0,
-                gid: 0,
+                uid: req.uid(),
+                gid: req.gid(),
                 rdev: 0,
                 flags: 0,
                 blksize: 0,
@@ -222,12 +261,14 @@ impl Filesystem for RemoteFilesystem {
             return;
         }
 
-        let inode_cache = self.inode_cache.lock().unwrap();
-        let path = if let Some(p) = inode_cache.get(&ino) {
-            p.clone()
-        } else {
-            reply.error(ENOENT);
-            return;
+        let path = {
+            let inode_cache = self.inode_cache.lock().unwrap();
+            if let Some(p) = inode_cache.get(&ino) {
+                p.clone()
+            } else {
+                reply.error(ENOENT);
+                return;
+            }
         };
 
         let metadata_cache = self.metadata_cache.lock().unwrap();
@@ -248,8 +289,8 @@ impl Filesystem for RemoteFilesystem {
                 kind: if file_info.file_type == "dir" { FileType::Directory } else { FileType::RegularFile },
                 perm,
                 nlink: 1,
-                uid: 0,
-                gid: 0,
+                uid: req.uid(),
+                gid: req.gid(),
                 rdev: 0,
                 flags: 0,
                 blksize: 512,
@@ -269,27 +310,38 @@ impl Filesystem for RemoteFilesystem {
             (FUSE_ROOT_ID, FileType::Directory, OsString::from(".."))
         ];
 
-        let mut inode_cache = self.inode_cache.lock().unwrap();
-        let path = if let Some(p) = inode_cache.get(&ino) {
-            p.clone()
-        } else {
-            reply.error(ENOENT);
-            return;
+        let path = {
+            let inode_cache = self.inode_cache.lock().unwrap();
+            if let Some(p) = inode_cache.get(&ino) {
+                p.clone()
+            } else {
+                reply.error(ENOENT);
+                return;
+            }
         };
 
         let url = self.server_url.join(&format!("/list/{}", path)).unwrap();
         let files: Vec<FileInfo> = match self.runtime.block_on(async {
             let client = reqwest::Client::new();
-            let res = client.get(url).send().await?;
-            res.json().await
+            let res = client.get(url).send().await.map_err(|_| EIO)?;
+
+            if res.status().as_u16() == 404 {
+                return Err(ENOENT);
+            }
+            if !res.status().is_success() {
+                return Err(EIO);
+            }
+
+            res.json().await.map_err(|_| EIO)
         }) {
             Ok(f) => f,
-            Err(_) => {
-                reply.error(EIO);
+            Err(errno) => {
+                reply.error(errno);
                 return;
             }
         };
 
+        let mut inode_cache = self.inode_cache.lock().unwrap();
         let mut metadata_cache = self.metadata_cache.lock().unwrap();
         for file in &files {
             let inode = if let Some((ino, _)) = metadata_cache.get(&file.path) {
@@ -317,21 +369,34 @@ impl Filesystem for RemoteFilesystem {
     fn read(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, offset: i64, size: u32, _flags: i32, _lock_owner: Option<u64>, reply: ReplyData) {
         println!("Performing read");
         
-        let inode_cache = self.inode_cache.lock().unwrap();
-        let path = if let Some(p) = inode_cache.get(&ino) {
-            p.clone()
-        } else {
-            reply.error(ENOENT);
-            return;
+        let path = {
+            let inode_cache = self.inode_cache.lock().unwrap();
+            if let Some(p) = inode_cache.get(&ino) {
+                p.clone()
+            } else {
+                reply.error(ENOENT);
+                return;
+            }
         };
 
         let url = self.server_url.join(&format!("/files/{}", path)).unwrap();
-        let data = self.runtime.block_on(async {
+        let data = match self.runtime.block_on(async {
             let client = reqwest::Client::new();
-            let res = client.get(url).send().await.unwrap();
-            
-			res.bytes().await.unwrap()
-        });
+            let res = client.get(url).send().await.map_err(|_| EIO)?;
+            if res.status().as_u16() == 404 {
+                return Err(ENOENT);
+            }
+            if !res.status().is_success() {
+                return Err(EIO);
+            }
+            res.bytes().await.map_err(|_| EIO)
+        }) {
+            Ok(b) => b,
+            Err(errno) => {
+                reply.error(errno);
+                return;
+            }
+        };
 
 
         let end = (offset + size as i64) as usize;
@@ -344,57 +409,89 @@ impl Filesystem for RemoteFilesystem {
         reply.data(data_slice);
     }
 
-    fn write(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, _offset: i64, data: &[u8], _write_flags: u32, _flags: i32, _lock_owner: Option<u64>, reply: fuser::ReplyWrite) {
+    fn write(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, offset: i64, data: &[u8], _write_flags: u32, _flags: i32, _lock_owner: Option<u64>, reply: fuser::ReplyWrite) {
         println!("Performing write");
         
-        let inode_cache = self.inode_cache.lock().unwrap();
-        let path = if let Some(p) = inode_cache.get(&ino) {
-            p.clone()
-        } else {
-            reply.error(ENOENT);
-            return;
+        let path = {
+            let inode_cache = self.inode_cache.lock().unwrap();
+            if let Some(p) = inode_cache.get(&ino) {
+                p.clone()
+            } else {
+                reply.error(ENOENT);
+                return;
+            }
         };
 
-        let url = self.server_url.join(&format!("/files/{}", path)).unwrap();
-        let res = self.runtime.block_on(async {
+        if offset < 0 {
+            reply.error(EIO);
+            return;
+        }
+
+        let url = self
+            .server_url
+            .join(&format!("/files/{}?offset={}", path, offset))
+            .unwrap();
+        let res = match self.runtime.block_on(async {
             let client = reqwest::Client::new();
-            let res = client.put(url).header("Content-Type", "application/octet-stream").body(data.to_vec()).send().await.unwrap();
-            
-			res.status()
-        });
+            let res = client
+                .put(url)
+                .header("Content-Type", "application/octet-stream")
+                .body(data.to_vec())
+                .send()
+                .await
+                .map_err(|_| EIO)?;
+            Ok::<_, i32>(res.status())
+        }) {
+            Ok(s) => s,
+            Err(errno) => {
+                reply.error(errno);
+                return;
+            }
+        };
 
         if res.is_success() {
-			let url = self.server_url.join(&format!("/stat/{}", path)).unwrap();
-			if let Ok(file_info) = self.runtime.block_on(async {
-				let client = reqwest::Client::new();
-				let res = client.get(url).send().await?;
-				res.json().await
-			}) {
-				let mut metadata_cache = self.metadata_cache.lock().unwrap();
-				if let Some((_, info)) = metadata_cache.get_mut(&path) {
-					*info = file_info;
-				}
-			}
+            let url = self.server_url.join(&format!("/stat/{}", path)).unwrap();
+            if let Ok(file_info) = self.runtime.block_on(async {
+                let client = reqwest::Client::new();
+                let res = client.get(url).send().await.map_err(|_| EIO)?;
+                if !res.status().is_success() {
+                    return Err(EIO);
+                }
+                res.json().await.map_err(|_| EIO)
+            }) {
+                let mut metadata_cache = self.metadata_cache.lock().unwrap();
+                if let Some((_, info)) = metadata_cache.get_mut(&path) {
+                    *info = file_info;
+                }
+            }
 			
             reply.written(data.len() as u32);
+        } else if res.as_u16() == 404 {
+            reply.error(ENOENT);
         } else {
             reply.error(EIO);
         }
     }
 
-    fn mkdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, mode: u32, _umask: u32, reply: fuser::ReplyEntry) {
+    fn mkdir(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, mode: u32, _umask: u32, reply: fuser::ReplyEntry) {
         println!("Performing mkdir");
         
-        let mut inode_cache = self.inode_cache.lock().unwrap();
-        let parent_path = if let Some(p) = inode_cache.get(&parent) {
-            p.clone()
-        } else {
-            reply.error(ENOENT);
-            return;
+        let parent_path = {
+            let inode_cache = self.inode_cache.lock().unwrap();
+            if let Some(p) = inode_cache.get(&parent) {
+                p.clone()
+            } else {
+                reply.error(ENOENT);
+                return;
+            }
         };
 
         let dir_name = name.to_str().unwrap();
-        let path = format!("{}/{}", parent_path, dir_name);
+        let path = if parent_path.is_empty() || parent_path == "/" {
+            dir_name.to_string()
+        } else {
+            format!("{}/{}", parent_path, dir_name)
+        };
 
         let url = self.server_url.join(&format!("/mkdir/{}", path)).unwrap();
         let res = self.runtime.block_on(async {
@@ -404,41 +501,50 @@ impl Filesystem for RemoteFilesystem {
         });
 
         if res.is_success() {
-            let mut next_inode_guard = self.next_inode.lock().unwrap();
-            let ino = *next_inode_guard;
-            *next_inode_guard += 1;
+            let (ino, now) = {
+                let mut inode_cache = self.inode_cache.lock().unwrap();
+                let mut metadata_cache = self.metadata_cache.lock().unwrap();
+                let mut next_inode = self.next_inode.lock().unwrap();
+
+                let ino = *next_inode;
+                *next_inode += 1;
+
+                let now = SystemTime::now();
+                let file_info = FileInfo {
+                    name: dir_name.to_string(),
+                    path: path.clone(),
+                    file_type: "dir".to_string(),
+                    size: 0,
+                    timestamp: now.duration_since(UNIX_EPOCH).unwrap().as_secs(),
+                    permissions: format!("{:o}", mode),
+                };
+                metadata_cache.insert(path.clone(), (ino, file_info));
+                inode_cache.insert(ino, path.clone());
+
+                (ino, now)
+            };
 
             let attr = FileAttr {
                 ino,
                 size: 0,
                 blocks: 0,
-                atime: SystemTime::now(),
-                mtime: SystemTime::now(),
-                ctime: SystemTime::now(),
-                crtime: SystemTime::now(),
+                atime: now,
+                mtime: now,
+                ctime: now,
+                crtime: now,
                 kind: FileType::Directory,
                 perm: mode as u16,
                 nlink: 2,
-                uid: 0,
-                gid: 0,
+                uid: req.uid(),
+                gid: req.gid(),
                 rdev: 0,
                 flags: 0,
                 blksize: 512,
             };
-
-            let mut metadata_cache = self.metadata_cache.lock().unwrap();
-            let file_info = FileInfo {
-                name: dir_name.to_string(),
-                path: path.clone(),
-                file_type: "dir".to_string(),
-                size: 0,
-                timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
-                permissions: format!("{:o}", mode),
-            };
-            metadata_cache.insert(path.clone(), (ino, file_info));
-            inode_cache.insert(ino, path.clone());
             
             reply.entry(&TTL, &attr, 0);
+        } else if res.as_u16() == 409 {
+            reply.error(EEXIST);
         } else {
             reply.error(EIO);
         }
@@ -456,7 +562,11 @@ impl Filesystem for RemoteFilesystem {
         };
 
         let file_name = name.to_str().unwrap();
-        let path = format!("{}/{}", parent_path, file_name);
+        let path = if parent_path.is_empty() || parent_path == "/" {
+            file_name.to_string()
+        } else {
+            format!("{}/{}", parent_path, file_name)
+        };
 
         let url = self.server_url.join(&format!("/files/{}", path)).unwrap();
         let res = self.runtime.block_on(async {
@@ -474,6 +584,8 @@ impl Filesystem for RemoteFilesystem {
             }
 
             reply.ok();
+        } else if res.as_u16() == 404 {
+            reply.error(ENOENT);
         } else {
             reply.error(EIO);
         }
@@ -491,7 +603,11 @@ impl Filesystem for RemoteFilesystem {
         };
 
         let dir_name = name.to_str().unwrap();
-        let path = format!("{}/{}", parent_path, dir_name);
+        let path = if parent_path.is_empty() || parent_path == "/" {
+            dir_name.to_string()
+        } else {
+            format!("{}/{}", parent_path, dir_name)
+        };
 
         let url = self.server_url.join(&format!("/files/{}", path)).unwrap();
         let res = self.runtime.block_on(async {
@@ -509,6 +625,8 @@ impl Filesystem for RemoteFilesystem {
             }
 
             reply.ok();
+        } else if res.as_u16() == 404 {
+            reply.error(ENOENT);
         } else {
             reply.error(EIO);
         }
@@ -540,16 +658,37 @@ pub fn run_fuser_client(filesystem: RemoteFilesystem) {
     }
     
     #[cfg(target_os = "linux")]
-    let _ = std::process::Command::new("fusermount")
-        .arg("-u")
-        .arg(mountpoint)
-        .status();
+    {
+        let try_unmount = |bin: &str, args: &[&str]| -> bool {
+            std::process::Command::new(bin)
+                .args(args)
+                .arg(mountpoint)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+
+        let unmounted = try_unmount("fusermount3", &["-u", "-z"])
+            || try_unmount("fusermount", &["-u", "-z"])
+            || std::process::Command::new("umount")
+                .args(["-l", mountpoint])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+
+        if !unmounted {
+            eprintln!(
+                "Warning: failed to unmount {} (it may still be busy). Try: fusermount3 -uz {}",
+                mountpoint, mountpoint
+            );
+        }
+    }
     #[cfg(target_os = "macos")]
     let _ = std::process::Command::new("umount")
         .arg(mountpoint)
         .status();
 
-    println!("Filesystem unmounted, exiting.");
+    println!("Exiting.");
     let _ = handle.join();
 }
 
