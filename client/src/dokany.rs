@@ -485,13 +485,134 @@ where 'h: 'c
 
     fn move_file(
         &'h self,
-        _file_name: &U16CStr,
-        _new_file_name: &U16CStr,
-        _replace_if_existing: bool,
+        file_name: &U16CStr,
+        new_file_name: &U16CStr,
+        replace_if_existing: bool,
         _info: &OperationInfo<'c, 'h, Self>,
         _context: &'c Self::Context
     ) -> Result<(), i32> {
-        Err(DOKAN_ERROR)
+        let path_str = file_name.to_string_lossy();
+        let path = normalize_path(&path_str);
+
+        let new_path_str = new_file_name.to_string_lossy();
+        let new_path = normalize_path(&new_path_str);
+
+        if path == new_path {
+            return Ok(());
+        }
+
+        let mut metadata_cache = self.metadata_cache.lock().unwrap();
+        if !replace_if_existing && metadata_cache.contains_key(&new_path) {
+            return Err(STATUS_OBJECT_NAME_COLLISION);
+        }
+        drop(metadata_cache);
+
+        let is_dir = {
+            let mut metadata_cache = self.metadata_cache.lock().unwrap();
+            if let Some((_, info)) = metadata_cache.get(&path) {
+                info.file_type == "dir"
+            } else {
+                drop(metadata_cache);
+                let url = self.server_url.join(&format!("/stat/{}", path)).map_err(|_| DOKAN_ERROR)?;
+                let res = self.runtime.block_on(async {
+                    reqwest::Client::new().get(url).send().await
+                });
+                match res {
+                    Ok(r) if r.status().is_success() => {
+                        let info = self.runtime.block_on(r.json::<RemoteFileInfo>()).map_err(|_| DOKAN_ERROR)?;
+                        info.file_type == "dir"
+                    },
+                    _ => return Err(STATUS_OBJECT_NAME_NOT_FOUND),
+                }
+            }
+        };
+
+        let client = reqwest::Client::new();
+        let base_url = self.server_url.clone();
+
+        fn move_recursive(
+            client: reqwest::Client,
+            base_url: reqwest::Url,
+            src: String,
+            dst: String,
+            is_dir: bool
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> {
+            Box::pin(async move {
+                let res = async {
+                    if is_dir {
+                        let mkdir_url = base_url.join(&format!("/mkdir/{}", dst)).ok()?;
+                        let res = client.post(mkdir_url).send().await.ok()?;
+                        if !res.status().is_success() && res.status().as_u16() != 409 { return None; }
+
+                        let list_url = base_url.join(&format!("/list/{}", src)).ok()?;
+                        let res = client.get(list_url).send().await.ok()?;
+                        if !res.status().is_success() { return None; }
+                        let files: Vec<RemoteFileInfo> = res.json().await.ok()?;
+
+                        for file in files {
+                            let child_src = format!("{}/{}", src, file.name);
+                            let child_dst = format!("{}/{}", dst, file.name);
+                            let child_is_dir = file.file_type == "dir";
+                            if !move_recursive(client.clone(), base_url.clone(), child_src, child_dst, child_is_dir).await {
+                                return None;
+                            }
+                        }
+                        let del_url = base_url.join(&format!("/files/{}", src)).ok()?;
+                        if client.delete(del_url).send().await.ok()?.status().is_success() { Some(()) } else { None }
+                    } else {
+                        let get_url = base_url.join(&format!("/files/{}", src)).ok()?;
+                        let res = client.get(get_url).send().await.ok()?;
+                        if !res.status().is_success() { return None; }
+                        let content = res.bytes().await.ok()?;
+
+                        let put_url = base_url.join(&format!("/files/{}", dst)).ok()?;
+                        let res = client.put(put_url).header("Content-Type", "application/octet-stream").body(content).send().await.ok()?;
+                        if !res.status().is_success() { return None; }
+
+                        let del_url = base_url.join(&format!("/files/{}", src)).ok()?;
+                        if client.delete(del_url).send().await.ok()?.status().is_success() { Some(()) } else { None }
+                    }
+                }.await;
+                res.is_some()
+            })
+        }
+
+        let success = self.runtime.block_on(move_recursive(client, base_url, path.clone(), new_path.clone(), is_dir));
+
+        if success {
+            let mut metadata_cache = self.metadata_cache.lock().unwrap();
+            let mut inode_cache = self.inode_cache.lock().unwrap();
+
+            if let Some((ino, mut info)) = metadata_cache.remove(&path) {
+                info.path = new_path.clone();
+                info.name = new_path.split('/').last().unwrap_or("").to_string();
+                
+                if let Some((dest_ino, _)) = metadata_cache.remove(&new_path) {
+                    inode_cache.remove(&dest_ino);
+                }
+                
+                metadata_cache.insert(new_path.clone(), (ino, info));
+                inode_cache.insert(ino, new_path.clone());
+            }
+
+            let path_prefix = format!("{}/", path);
+            let new_path_prefix = format!("{}/", new_path);
+            let keys: Vec<String> = metadata_cache.keys().filter(|k| k.starts_with(&path_prefix)).cloned().collect();
+
+            for key in keys {
+                if let Some((ino, mut info)) = metadata_cache.remove(&key) {
+                    let suffix = &key[path_prefix.len()..];
+                    let new_child_path = format!("{}{}", new_path_prefix, suffix);
+                    info.path = new_child_path.clone();
+                    metadata_cache.insert(new_child_path.clone(), (ino, info));
+                    inode_cache.insert(ino, new_child_path);
+                }
+            }
+
+            Ok(())
+        } else {
+            Err(DOKAN_ERROR)
+        }
     }
 
     fn set_end_of_file(
