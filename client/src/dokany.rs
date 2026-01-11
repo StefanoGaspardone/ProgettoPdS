@@ -603,14 +603,14 @@ where 'h: 'c
             return Ok(());
         }
 
-        let mut metadata_cache = self.metadata_cache.lock().unwrap();
+        let metadata_cache = self.metadata_cache.lock().unwrap();
         if !replace_if_existing && metadata_cache.contains_key(&new_path) {
             return Err(STATUS_OBJECT_NAME_COLLISION);
         }
         drop(metadata_cache);
 
         let is_dir = {
-            let mut metadata_cache = self.metadata_cache.lock().unwrap();
+            let metadata_cache = self.metadata_cache.lock().unwrap();
             if let Some((_, info)) = metadata_cache.get(&path) {
                 info.file_type == "dir"
             } else {
