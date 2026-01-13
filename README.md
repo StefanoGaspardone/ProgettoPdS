@@ -1,148 +1,183 @@
-#  ProgettoPdS - Remote Filesystem
+# ProgettoPdS - Remote Filesystem (NFS User Space)
 
-##  Descrizione del Progetto
-Questo progetto implementa un **filesystem remoto** basato su un'architettura **Client-Server**.
+## Descrizione del Progetto
 
-L'obiettivo è permettere di montare una cartella virtuale sul proprio computer locale; le operazioni eseguite su questa cartella (creazione file, scrittura, lettura, cancellazione) vengono intercettate dal **Client** e inviate al **Server** remoto che gestisce l'effettivo storage dei dati.
+Questo progetto implementa un **Network Filesystem (NFS) in User Space**.  
+L'applicazione permette di montare una cartella virtuale sul computer locale (**Client**) che, invece di scrivere su disco, comunica le operazioni a un **Server remoto** tramite protocollo **HTTP**.
 
----
+Il sistema intercetta le chiamate di sistema (*syscall*) del kernel tramite:
+- **FUSE** su Linux/macOS
+- **Dokan** su Windows  
 
-##  Architettura del Codice
-Il progetto è diviso in due componenti principali:
-
-###  Server (`/server`)
-- Scritto in **Node.js**
-- Gestisce le richieste in arrivo dal client
-- Mantiene lo stato dei file
-
-###  Client (`/client`)
-- Scritto in **Rust**
-- Si interfaccia con il kernel del sistema operativo per montare il filesystem
-- Usa:
-  - **FUSE** (via `fuser`) su Linux/macOS
-  - **Dokan** (via `dokany`) su Windows
+e le traduce in richieste **REST API** verso un server **Node.js**.
 
 ---
 
-##  Prerequisiti
+## Architettura Tecnica
 
-### Generale (Tutti i sistemi)
-- **Node.js** (per il server)
-- **Rust & Cargo** (per il client)
-- **Nodemon** (opzionale, per il server)
+Il progetto è strutturato in due componenti principali.
+
+### Server (`/server`) — Node.js
+Il server agisce da interfaccia verso lo storage fisico.
+
+- **Protocollo REST**  
+  Espone endpoint HTTP per ogni operazione del filesystem  
+  *(es. `GET /list` per `ls`, `PUT /files` per la scrittura dati)*.
+
+- **Sicurezza (Path Sanitization)**  
+  Implementa controlli rigorosi sui percorsi tramite la funzione  
+  `resolveUnderRemoteRoot`, prevenendo attacchi di **Path Traversal**  
+  e garantendo che i client non possano accedere a file esterni alla root dedicata.
+
+- **Gestione I/O**  
+  Utilizza `fs.promises` per operazioni asincrone ed efficienti su disco.
+
+---
+
+### Client (`/client`) — Rust
+Il client è responsabile del montaggio del filesystem e della traduzione delle operazioni.
+
+- **FUSE & Dokan**  
+  Usa le librerie:
+  - `fuser` (Linux / macOS)
+  - `dokany` (Windows)
+
+- **Inode Cache**  
+  Il kernel identifica i file tramite **inode**, mentre il server utilizza percorsi stringa.  
+  Il client mantiene una `HashMap` in memoria (protetta da `Mutex`) per la traduzione:
+  ```
+  Inode <-> Path
+  ```
+
+- **Ponte Sincrono / Asincrono**  
+  Le callback del filesystem sono sincrone, mentre le richieste HTTP sono asincrone.  
+  Il client utilizza il runtime **Tokio** per eseguire chiamate `reqwest` all'interno
+  delle operazioni del driver filesystem.
+
+---
+
+## Prerequisiti
+
+### Generale
+- **Node.js** (v16+ raccomandato)
+- **Rust & Cargo** (ultima versione stabile)
+- **Nodemon** (opzionale):
   ```bash
   npm i -g nodemon
   ```
 
-###  Linux
-Assicurati di avere installato i pacchetti per FUSE:
+### Linux (Debian / Ubuntu)
+Installare le librerie necessarie per FUSE:
 ```bash
+sudo apt update
 sudo apt install build-essential pkg-config libssl-dev libfuse3-dev libfuse-dev
 ```
 
-###  Windows
-È necessario installare i driver **Dokan Library**.  
-Scarica e installa l'ultima versione dal sito ufficiale o dal repository GitHub di Dokan.
+### Windows
+Installare **Dokan Library** (driver filesystem).  
+Scaricare `DokanSetup.exe` dalle release ufficiali GitHub di Dokan.
 
-###  macOS
-È necessario installare **macFUSE**.
+### macOS
+Installare **macFUSE**.
 
 ---
 
-##  Esecuzione
+## Esecuzione
 
-### 1️ Avvio del Server
-Il server deve essere avviato **prima** del client.
+### Avvio del Server
+Il server deve essere avviato per primo.  
+Si metterà in ascolto sulla porta **3000**.
+
 ```bash
 cd server
 npm install
 npm run dev
 ```
-Il server si metterà in ascolto (es. `http://localhost:3000`).
 
 ---
 
-### 2️ Avvio del Client
-Apri un nuovo terminale.
+### Avvio del Client
 
- **Nota Importante**  
-Prima di avviare il client, assicurati che la cartella di mount sia pulita.
+⚠️ **Nota Importante**  
+Prima di avviare il client, è consigliabile pulire la cartella di mount.
 
 ```bash
-# Esegui dalla root del progetto
+# Dalla root del progetto
 rm -rf client/mnt/remote-fs && mkdir -p client/mnt/remote-fs
 ```
 
-Esegui il client:
+Avvio del client:
 ```bash
 cd client
 cargo run
 ```
 
-> **Nota:** Il comando `cargo run` scaricherà automaticamente le dipendenze Rust la prima volta.
+> Al primo avvio, Cargo scaricherà e compilerà tutte le dipendenze Rust.
 
 ---
 
-##  Test Manuale (Workflow)
+## Guida ai Test
 
-Una volta che il client è in esecuzione e la cartella è montata, puoi testare le funzionalità del filesystem.
+Una volta montato il filesystem, la cartella  
+`client/mnt/remote-fs` può essere usata come una normale unità di memoria.
 
-### Sequenza di Test (Linux / macOS - Bash)
-Esegui i seguenti comandi all'interno della cartella montata (`client/mnt/remote-fs`):
+### Workflow di Test (Linux / macOS - Bash)
 
 ```bash
-ls -la                  # Lista file iniziali
-mkdir files             # Crea cartella
+cd client/mnt/remote-fs
+
+ls -la                  # 1. Lista directory vuota
+mkdir files             # 2. Creazione cartella
 cd files
-echo "AAA" > a.txt      # Scrivi su file
-cat a.txt               # Leggi file
-echo "BBB" >> a.txt     # Appendi al file
-cat a.txt               # Verifica append
-rm a.txt                # Rimuovi file
+echo "AAA" > a.txt      # 3. Scrittura file
+cat a.txt               # 4. Lettura
+echo "BBB" >> a.txt     # 5. Append
+cat a.txt               # 6. Verifica contenuto
+rm a.txt                # 7. Cancellazione file
 cd ..
-rmdir files             # Rimuovi cartella
-touch empty.txt         # Crea file vuoto
+rmdir files             # 8. Cancellazione cartella
+touch empty.txt         # 9. Creazione file vuoto
+stat empty.txt          # 10. Verifica metadati
 echo "hello" > old.txt
-mv old.txt new.txt      # Rinomina file
+mv old.txt new.txt      # 11. Rinomina file
 cat new.txt
 mkdir dir_old
-mv dir_old dir_new      # Rinomina cartella
-ls -la                  # Verifica finale
+mv dir_old dir_new      # 12. Rinomina directory
+ls -la
 ```
 
 ---
 
-## Equivalenti Comandi per Windows (PowerShell)
+## Comandi Equivalenti per Windows
 
-| Azione | Comando Linux | Comando PowerShell |
-|------|---------------|--------------------|
-| Lista file | `ls -la` | `Get-ChildItem -Force` |
-| Crea cartella | `mkdir dir` | `mkdir dir` |
-| Scrivi (nuovo) | `echo "A" > a.txt` | `"A" > a.txt` |
-| Scrivi (append) | `echo "B" >> a.txt` | `Add-Content a.txt "B"` |
-| Leggi file | `cat a.txt` | `Get-Content a.txt` |
-| File vuoto | `touch f.txt` | `New-Item f.txt` |
-| Rimuovi file | `rm a.txt` | `rm a.txt` |
-| Rimuovi directory | `rmdir dir` | `rmdir dir` |
-| Rinomina/Sposta | `mv old new` | `mv old new` |
-| Info file | `stat file` | `Get-Item file` |
+| Azione | Linux | PowerShell | CMD |
+|------|------|------------|-----|
+| Lista file | `ls -la` | `ls` | `dir` |
+| Cambia dir | `cd dir` | `cd dir` | `cd dir` |
+| Crea dir | `mkdir dir` | `mkdir dir` | `mkdir dir` |
+| Scrivi (nuovo) | `echo A > f.txt` | `"A" > f.txt` | `echo A > f.txt` |
+| Scrivi (append) | `echo B >> f.txt` | `Add-Content f.txt "B"` | `echo B >> f.txt` |
+| Leggi file | `cat f.txt` | `Get-Content f.txt` | `type f.txt` |
+| File vuoto | `touch f.txt` | `New-Item f.txt` | `type nul > f.txt` |
+| Rimuovi file | `rm f.txt` | `rm f.txt` | `del f.txt` |
+| Rimuovi dir | `rmdir dir` | `rmdir dir` | `rmdir dir` |
+| Rinomina | `mv old new` | `mv old new` | `move old new` |
 
 ---
 
-##  Risoluzione Problemi (Troubleshooting)
+## Risoluzione Problemi (Troubleshooting)
 
-### Il filesystem non si smonta correttamente?
-Se il programma crasha o viene interrotto forzatamente, la cartella potrebbe rimanere "bloccata".
+Se il programma viene interrotto bruscamente, la cartella di mount potrebbe rimanere bloccata.
 
-#### Linux
+### Linux
 ```bash
 fusermount3 -uz client/mnt/remote-fs
 # Oppure
 sudo umount -l client/mnt/remote-fs
 ```
 
-#### Windows
-Dokan solitamente smonta automaticamente il filesystem alla chiusura dell'applicazione.  
-Se il problema persiste, prova a:
+### Windows
+Il driver **Dokan** gestisce solitamente lo smontaggio automatico.  
+Se il drive rimane bloccato:
 - Riavviare il sistema
-- Usare il gestore dischi di Dokan
+- Usare il tool **Dokan Library Mounter**
