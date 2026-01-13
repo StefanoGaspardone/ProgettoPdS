@@ -72,6 +72,14 @@ Il client è responsabile del montaggio del filesystem e della traduzione delle 
   npm i -g nodemon
   ```
 
+### Clonazione del Repository
+
+Clonare il repository GitHub:
+
+```bash
+git clone https://github.com/StefanoGaspardone/ProgettoPdS.git
+```
+
 ### Linux (Debian / Ubuntu)
 
 Installare le librerie necessarie per FUSE:
