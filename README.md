@@ -1,105 +1,148 @@
-# ProgettoPdS
+#  ProgettoPdS - Remote Filesystem
 
-SERVER
-npm i
+##  Descrizione del Progetto
+Questo progetto implementa un **filesystem remoto** basato su un'architettura **Client-Server**.
+
+L'obiettivo è permettere di montare una cartella virtuale sul proprio computer locale; le operazioni eseguite su questa cartella (creazione file, scrittura, lettura, cancellazione) vengono intercettate dal **Client** e inviate al **Server** remoto che gestisce l'effettivo storage dei dati.
+
+---
+
+##  Architettura del Codice
+Il progetto è diviso in due componenti principali:
+
+###  Server (`/server`)
+- Scritto in **Node.js**
+- Gestisce le richieste in arrivo dal client
+- Mantiene lo stato dei file
+
+###  Client (`/client`)
+- Scritto in **Rust**
+- Si interfaccia con il kernel del sistema operativo per montare il filesystem
+- Usa:
+  - **FUSE** (via `fuser`) su Linux/macOS
+  - **Dokan** (via `dokany`) su Windows
+
+---
+
+##  Prerequisiti
+
+### Generale (Tutti i sistemi)
+- **Node.js** (per il server)
+- **Rust & Cargo** (per il client)
+- **Nodemon** (opzionale, per il server)
+  ```bash
+  npm i -g nodemon
+  ```
+
+###  Linux
+Assicurati di avere installato i pacchetti per FUSE:
+```bash
+sudo apt install build-essential pkg-config libssl-dev libfuse3-dev libfuse-dev
+```
+
+###  Windows
+È necessario installare i driver **Dokan Library**.  
+Scarica e installa l'ultima versione dal sito ufficiale o dal repository GitHub di Dokan.
+
+###  macOS
+È necessario installare **macFUSE**.
+
+---
+
+##  Esecuzione
+
+### 1️ Avvio del Server
+Il server deve essere avviato **prima** del client.
+```bash
+cd server
+npm install
 npm run dev
-(make sure nodemon is installed - npm i -g nodemon)
+```
+Il server si metterà in ascolto (es. `http://localhost:3000`).
 
-- FUSE - Linux  
-make sure "build-essential", "pkg-config", "libssl-dev", "libfuse3-dev", "libfuse-dev" are installed
+---
 
-  - ls -la
-  - mkdir files
-  - cd files
-  - ls -la
-  - echo "AAA" > a.txt
-  - cat a.txt
-  - echo "BBB" >> a.txt
-  - cat a.txt
-  - rm a.txt
-  - cd ..
-  - rmdir files
-  - touch empty.txt
-  - : > empty.txt
-  - stat empty.txt
-  - echo "hello" > old.txt
-  - mv old.txt new.txt
-  - cat new.txt
-  - mkdir dir_old
-  - mv dir_old dir_new
-  - ls -la
+### 2️ Avvio del Client
+Apri un nuovo terminale.
 
-  - fusermount3 -uz client/mnt/remote-fs || fusermount -uz client/mnt/remote-fs || sudo umount -l client/mnt/remote-fs
-  - rm -rf client/mnt/remote-fs && mkdir -p client/mnt/remote-fs
+ **Nota Importante**  
+Prima di avviare il client, assicurati che la cartella di mount sia pulita.
 
-- DOKAN - Windows  
-make sure "Dokan Library" is installed
+```bash
+# Esegui dalla root del progetto
+rm -rf client/mnt/remote-fs && mkdir -p client/mnt/remote-fs
+```
 
-- macFUSE - MacOS  
-make sure "macFUSE" is installed
+Esegui il client:
+```bash
+cd client
+cargo run
+```
 
------
+> **Nota:** Il comando `cargo run` scaricherà automaticamente le dipendenze Rust la prima volta.
 
-make sure to delete all files inside client/mnt/remote-fs before running the client
+---
 
------
+##  Test Manuale (Workflow)
 
-## Equivalenti dei comandi Linux su Windows (PowerShell e cmd)
+Una volta che il client è in esecuzione e la cartella è montata, puoi testare le funzionalità del filesystem.
 
-Di seguito gli equivalenti diretti per i comandi che usi su Linux. Per ognuno mostro la versione per PowerShell (consigliato) e per `cmd` quando differente.
+### Sequenza di Test (Linux / macOS - Bash)
+Esegui i seguenti comandi all'interno della cartella montata (`client/mnt/remote-fs`):
 
-- Cambiare directory:
-  - Linux: `cd dir`
-  - PowerShell / cmd: `cd dir`
+```bash
+ls -la                  # Lista file iniziali
+mkdir files             # Crea cartella
+cd files
+echo "AAA" > a.txt      # Scrivi su file
+cat a.txt               # Leggi file
+echo "BBB" >> a.txt     # Appendi al file
+cat a.txt               # Verifica append
+rm a.txt                # Rimuovi file
+cd ..
+rmdir files             # Rimuovi cartella
+touch empty.txt         # Crea file vuoto
+echo "hello" > old.txt
+mv old.txt new.txt      # Rinomina file
+cat new.txt
+mkdir dir_old
+mv dir_old dir_new      # Rinomina cartella
+ls -la                  # Verifica finale
+```
 
-- Lista file (ls -la):
-  - Linux: `ls -la`
-  - PowerShell: `Get-ChildItem -Force` (alias `ls`, `dir`)
-  - cmd: `dir`
+---
 
-- Creare cartelle (mkdir):
-  - Linux: `mkdir dir`
-  - PowerShell: `New-Item -ItemType Directory -Path dir` oppure `mkdir dir`
-  - cmd: `mkdir dir`
+## Equivalenti Comandi per Windows (PowerShell)
 
-- Scrivere su file (sovrascrivere / appendere):
-  - Linux: `echo "AAA" > a.txt` / `echo "BBB" >> a.txt`
-  - PowerShell: `"AAA" > a.txt` (sovrascrive), `"BBB" >> a.txt` (appende); o `Set-Content a.txt "AAA"` / `Add-Content a.txt "BBB"`
-  - cmd: `echo AAA > a.txt` / `echo BBB >> a.txt` TODO
+| Azione | Comando Linux | Comando PowerShell |
+|------|---------------|--------------------|
+| Lista file | `ls -la` | `Get-ChildItem -Force` |
+| Crea cartella | `mkdir dir` | `mkdir dir` |
+| Scrivi (nuovo) | `echo "A" > a.txt` | `"A" > a.txt` |
+| Scrivi (append) | `echo "B" >> a.txt` | `Add-Content a.txt "B"` |
+| Leggi file | `cat a.txt` | `Get-Content a.txt` |
+| File vuoto | `touch f.txt` | `New-Item f.txt` |
+| Rimuovi file | `rm a.txt` | `rm a.txt` |
+| Rimuovi directory | `rmdir dir` | `rmdir dir` |
+| Rinomina/Sposta | `mv old new` | `mv old new` |
+| Info file | `stat file` | `Get-Item file` |
 
-- Visualizzare il contenuto (cat):
-  - Linux: `cat a.txt`
-  - PowerShell: `Get-Content a.txt`
-  - cmd: `type a.txt`
+---
 
-- Creare file vuoto / truncare (touch / `: > file`):
-  - Linux: `touch empty.txt` / `: > empty.txt`
-  - PowerShell: `New-Item -ItemType File -Force empty.txt` oppure `"" > empty.txt`
-  - cmd: `type nul > empty.txt`
+##  Risoluzione Problemi (Troubleshooting)
 
-- Rimuovere file (rm):
-  - Linux: `rm a.txt`
-  - PowerShell: `Remove-Item a.txt` (alias `rm`)
-  - cmd: `del a.txt`
+### Il filesystem non si smonta correttamente?
+Se il programma crasha o viene interrotto forzatamente, la cartella potrebbe rimanere "bloccata".
 
-- Rimuovere directory (vuota o ricorsiva):
-  - Linux: `rmdir dir` oppure `rm -r dir`
-  - PowerShell: `Remove-Item -Recurse -Force dir`
-  - cmd: `rmdir dir`
+#### Linux
+```bash
+fusermount3 -uz client/mnt/remote-fs
+# Oppure
+sudo umount -l client/mnt/remote-fs
+```
 
-- Rinominare / spostare (mv):
-  - Linux: `mv old.txt new.txt` / `mv dir_old dir_new`
-  - PowerShell: `Move-Item old.txt new.txt`
-  - cmd: `move old.txt new.txt`
-
-- Copiare file (cp):
-  - Linux: `cp src dest`
-  - PowerShell: `Copy-Item src dest`
-  - cmd: `copy src dest`
-
-- Stat file (stat):
-  - Linux: `stat file`
-  - PowerShell: `Get-Item file | Format-List *` oppure `Get-ChildItem file | Select-Object *`
-  - cmd: non disponibile nativamente (usa PowerShell per info dettagliate)
-
-Se vuoi, converto gli esempi Linux già presenti sopra (con `a.txt`, `old.txt`, `dir_old`, ecc.) in una lista passo-passo equivalente per PowerShell e `cmd`.
+#### Windows
+Dokan solitamente smonta automaticamente il filesystem alla chiusura dell'applicazione.  
+Se il problema persiste, prova a:
+- Riavviare il sistema
+- Usare il gestore dischi di Dokan
