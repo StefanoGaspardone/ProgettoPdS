@@ -1,4 +1,4 @@
-# ProgettoPdS - Remote Filesystem (NFS User Space)
+# Remote File System
 
 ## Descrizione del Progetto
 
@@ -6,6 +6,7 @@ Questo progetto implementa un **Network Filesystem (NFS) in User Space**.
 L'applicazione permette di montare una cartella virtuale sul computer locale (**Client**) che, invece di scrivere su disco, comunica le operazioni a un **Server remoto** tramite protocollo **HTTP**.
 
 Il sistema intercetta le chiamate di sistema (*syscall*) del kernel tramite:
+
 - **FUSE** su Linux/macOS
 - **Dokan** su Windows  
 
@@ -18,6 +19,7 @@ e le traduce in richieste **REST API** verso un server **Node.js**.
 Il progetto è strutturato in due componenti principali.
 
 ### Server (`/server`) — Node.js
+
 Il server agisce da interfaccia verso lo storage fisico.
 
 - **Protocollo REST**  
@@ -35,6 +37,7 @@ Il server agisce da interfaccia verso lo storage fisico.
 ---
 
 ### Client (`/client`) — Rust
+
 Il client è responsabile del montaggio del filesystem e della traduzione delle operazioni.
 
 - **FUSE & Dokan**  
@@ -45,7 +48,8 @@ Il client è responsabile del montaggio del filesystem e della traduzione delle 
 - **Inode Cache**  
   Il kernel identifica i file tramite **inode**, mentre il server utilizza percorsi stringa.  
   Il client mantiene una `HashMap` in memoria (protetta da `Mutex`) per la traduzione:
-  ```
+
+  ```bash
   Inode <-> Path
   ```
 
@@ -59,25 +63,31 @@ Il client è responsabile del montaggio del filesystem e della traduzione delle 
 ## Prerequisiti
 
 ### Generale
+
 - **Node.js** (v16+ raccomandato)
 - **Rust & Cargo** (ultima versione stabile)
 - **Nodemon** (opzionale):
+
   ```bash
   npm i -g nodemon
   ```
 
 ### Linux (Debian / Ubuntu)
+
 Installare le librerie necessarie per FUSE:
+
 ```bash
 sudo apt update
 sudo apt install build-essential pkg-config libssl-dev libfuse3-dev libfuse-dev
 ```
 
 ### Windows
+
 Installare **Dokan Library** (driver filesystem).  
 Scaricare `DokanSetup.exe` dalle release ufficiali GitHub di Dokan.
 
 ### macOS
+
 Installare **macFUSE**.
 
 ---
@@ -85,6 +95,7 @@ Installare **macFUSE**.
 ## Esecuzione
 
 ### Avvio del Server
+
 Il server deve essere avviato per primo.  
 Si metterà in ascolto sulla porta **3000**.
 
@@ -98,8 +109,8 @@ npm run dev
 
 ### Avvio del Client
 
-⚠️ **Nota Importante**  
-Prima di avviare il client, è consigliabile pulire la cartella di mount.
+> ⚠️ **Nota importante**  
+> Prima di avviare il client, è consigliabile pulire la cartella di mount.
 
 ```bash
 # Dalla root del progetto
@@ -107,12 +118,13 @@ rm -rf client/mnt/remote-fs && mkdir -p client/mnt/remote-fs
 ```
 
 Avvio del client:
+
 ```bash
 cd client
 cargo run
 ```
 
-> Al primo avvio, Cargo scaricherà e compilerà tutte le dipendenze Rust.
+Al primo avvio, Cargo scaricherà e compilerà tutte le dipendenze Rust.
 
 ---
 
@@ -151,7 +163,7 @@ ls -la
 ## Comandi Equivalenti per Windows
 
 | Azione | Linux | PowerShell | CMD |
-|------|------|------------|-----|
+| ------ | ------ | ------------ | ----- |
 | Lista file | `ls -la` | `ls` | `dir` |
 | Cambia dir | `cd dir` | `cd dir` | `cd dir` |
 | Crea dir | `mkdir dir` | `mkdir dir` | `mkdir dir` |
@@ -170,6 +182,7 @@ ls -la
 Se il programma viene interrotto bruscamente, la cartella di mount potrebbe rimanere bloccata.
 
 ### Linux
+
 ```bash
 fusermount3 -uz client/mnt/remote-fs
 # Oppure
@@ -177,7 +190,9 @@ sudo umount -l client/mnt/remote-fs
 ```
 
 ### Windows
+
 Il driver **Dokan** gestisce solitamente lo smontaggio automatico.  
 Se il drive rimane bloccato:
+
 - Riavviare il sistema
 - Usare il tool **Dokan Library Mounter**
