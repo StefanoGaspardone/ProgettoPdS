@@ -1,5 +1,4 @@
 import express from 'express';
-import morgan from 'morgan';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -14,7 +13,6 @@ const PORT = 3000;
 const app = express();
 
 app.use(express.json());
-app.use(morgan('dev'));
 
 const pathExists = async (filePath) => {
     try {
@@ -32,10 +30,7 @@ const normalizeRequestPath = (pathParts) => {
     const normalized = path.posix.normalize(noLeadingSlashes);
     const relative = normalized === '.' ? '' : normalized;
 
-    // Prevent escaping the remote root via .. or absolute-like paths
-    if (relative.startsWith('..') || relative.includes('/../')) {
-        throw new Error('Invalid path');
-    }
+    if(relative.startsWith('..') || relative.includes('/../')) throw new Error('Invalid path');
 
     return relative;
 };
@@ -44,32 +39,23 @@ const resolveUnderRemoteRoot = (pathParts) => {
     const relativePath = normalizeRequestPath(pathParts);
     const fullPath = path.resolve(REMOTE_FS_ROOT, relativePath);
 
-    // Extra safety: ensure the resolved path is still under the root
-    if (fullPath !== REMOTE_FS_ROOT && !fullPath.startsWith(REMOTE_FS_ROOT + path.sep)) {
-        throw new Error('Invalid path');
-    }
+    if(fullPath !== REMOTE_FS_ROOT && !fullPath.startsWith(REMOTE_FS_ROOT + path.sep)) throw new Error('Invalid path');
 
     return { relativePath, fullPath };
 };
 
 const resolveUnderRemoteRootFromString = (rawPath) => {
-    if (typeof rawPath !== 'string') {
-        throw new Error('Invalid path');
-    }
+    if(typeof rawPath !== 'string') throw new Error('Invalid path');
 
     const forwardSlashes = rawPath.replaceAll('\\', '/');
     const noLeadingSlashes = forwardSlashes.replace(/^\/+/, '');
     const normalized = path.posix.normalize(noLeadingSlashes);
     const relativePath = normalized === '.' ? '' : normalized;
 
-    if (relativePath.startsWith('..') || relativePath.includes('/../')) {
-        throw new Error('Invalid path');
-    }
+    if(relativePath.startsWith('..') || relativePath.includes('/../')) throw new Error('Invalid path');
 
     const fullPath = path.resolve(REMOTE_FS_ROOT, relativePath);
-    if (fullPath !== REMOTE_FS_ROOT && !fullPath.startsWith(REMOTE_FS_ROOT + path.sep)) {
-        throw new Error('Invalid path');
-    }
+    if(fullPath !== REMOTE_FS_ROOT && !fullPath.startsWith(REMOTE_FS_ROOT + path.sep)) throw new Error('Invalid path');
 
     return { relativePath, fullPath };
 };
@@ -104,8 +90,10 @@ const getPermissionsString = (mode, isDirectory) => {
 
 // List directory contents
 app.get('/list{/*path}', async (req, res) => {
+    console.log('[/list] Richiesta lista contenuti directory');
     try {
         const { relativePath: dirPath, fullPath } = resolveUnderRemoteRoot(req.params.path);
+        console.log(`[/list] Path richiesto: ${dirPath}`);
         
         if(!await pathExists(fullPath)) return res.status(404).json({ success: false, message: `Path "${dirPath}" does not exist` });
         if(!(await fs.promises.stat(fullPath)).isDirectory()) return res.status(400).json({ success: false, message: `Path "${dirPath}" does not correspond to a directory` });
@@ -135,8 +123,10 @@ app.get('/list{/*path}', async (req, res) => {
 
 // Read file contents
 app.get('/files{/*path}', async (req, res) => {
+    console.log('[GET /files] Richiesta lettura contenuto file');
     try {
         const { relativePath: filePath, fullPath } = resolveUnderRemoteRoot(req.params.path);
+        console.log(`[GET /files] Path richiesto: ${filePath}`);
         
         if(!await pathExists(fullPath)) return res.status(404).json({ success: false, message: `Path "${filePath}" does not exist` });
         if((await fs.promises.stat(fullPath)).isDirectory()) return res.status(400).json({ success: false, message: `Path "${filePath}" does not correspond to a file` });
@@ -152,12 +142,12 @@ app.get('/files{/*path}', async (req, res) => {
 
 // Write file contents
 app.put('/files{/*path}', express.raw({ type: '*/*', limit: '50mb' }), async (req, res) => {
+    console.log('[PUT /files] Richiesta scrittura contenuto file');
     try {
         const data = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
-
-        console.log(req.params);
         
         const { relativePath: filePath, fullPath } = resolveUnderRemoteRoot(req.params.path);
+        console.log(`[PUT /files] Path richiesto: ${filePath}, dimensione dati: ${data.length} bytes`);
         const offset = Number.isFinite(Number(req.query.offset)) ? Number(req.query.offset) : 0;
         if(offset < 0) return res.status(400).json({ success: false, message: 'Invalid offset' });
         
@@ -186,9 +176,11 @@ app.put('/files{/*path}', express.raw({ type: '*/*', limit: '50mb' }), async (re
 
 // Truncate file to a specific size
 app.post('/truncate{/*path}', async (req, res) => {
+    console.log('[/truncate] Richiesta troncamento file');
     try {
         const { relativePath: filePath, fullPath } = resolveUnderRemoteRoot(req.params.path);
         const size = req.body?.size;
+        console.log(`[/truncate] Path richiesto: ${filePath}, nuova dimensione: ${size}`);
 
         if(!Number.isInteger(size) || size < 0) return res.status(400).json({ success: false, message: 'Invalid size' });
 
@@ -205,9 +197,11 @@ app.post('/truncate{/*path}', async (req, res) => {
 
 // Rename and move a file / dir
 app.post('/rename', async (req, res) => {
+    console.log('[/rename] Richiesta rinomina/spostamento file o directory');
     try {
         const from = req.body?.from;
         const to = req.body?.to;
+        console.log(`[/rename] Da: ${from} -> A: ${to}`);
 
         const { relativePath: fromPath, fullPath: fromFullPath } = resolveUnderRemoteRootFromString(from);
         const { relativePath: toPath, fullPath: toFullPath } = resolveUnderRemoteRootFromString(to);
@@ -227,8 +221,10 @@ app.post('/rename', async (req, res) => {
 
 // Create directory
 app.post('/mkdir{/*path}', async (req, res) => {
+    console.log('[/mkdir] Richiesta creazione directory');
     try {
         const { relativePath: dirPath, fullPath } = resolveUnderRemoteRoot(req.params.path);
+        console.log(`[/mkdir] Path richiesto: ${dirPath}`);
 
         if(await pathExists(fullPath)) return res.status(409).json({ success: false, message: `Path "${dirPath}" already exists` });
     
@@ -242,8 +238,10 @@ app.post('/mkdir{/*path}', async (req, res) => {
 
 // Delete file or repository
 app.delete('/files{/*path}', async (req, res) => {
+    console.log('[DELETE /files] Richiesta eliminazione file o directory');
     try {
         const { relativePath: dirPath, fullPath } = resolveUnderRemoteRoot(req.params.path);
+        console.log(`[DELETE /files] Path richiesto: ${dirPath}`);
         
         if(dirPath === '') return res.status(409).json({ success: false, message: 'You cannot remove the whole file system' });
         if(!await pathExists(fullPath)) return res.status(404).json({ success: false, message: `Path "${dirPath}" does not exist` });
@@ -261,7 +259,7 @@ app.get('/stat{/*path}', async (req, res) => {
     try {
         const { relativePath: filePath, fullPath } = resolveUnderRemoteRoot(req.params.path);
         
-        if (!await pathExists(fullPath)) return res.status(404).json({ success: false, message: `Path "${filePath}" does not exist` });
+        if(!await pathExists(fullPath)) return res.status(404).json({ success: false, message: `Path "${filePath}" does not exist` });
         
         const stats = await fs.promises.stat(fullPath);
         const isDir = stats.isDirectory();
@@ -274,7 +272,7 @@ app.get('/stat{/*path}', async (req, res) => {
             timestamp: Math.floor(stats.mtimeMs / 1000),
             permissions: getPermissionsString(stats.mode, isDir),
         });
-    } catch (error) {
+    } catch(error) {
         console.log(error);
         return res.status(500).json({ success: false, message: error.message });
     }
