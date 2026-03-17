@@ -1,0 +1,3 @@
+﻿<Project>
+  <Import Project="..\build\remote-fs-server.props" />
+</Project>

@@ -1,0 +1,11 @@
+{
+  "Version": 1,
+  "Hash": "P9rjJ14q3YiaqJlQx2X7ZsNzccPP00skfc8sQWUuUyE=",
+  "Source": "remote-fs-server",
+  "BasePath": "_content/remote-fs-server",
+  "Mode": "Default",
+  "ManifestType": "Build",
+  "ReferencedProjectsConfiguration": [],
+  "DiscoveryPatterns": [],
+  "Assets": []
+}
