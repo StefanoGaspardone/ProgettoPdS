@@ -63,7 +63,7 @@ impl RemoteFilesystem {
 }
 
 fn main() {
-    let server_url = "http://localhost:3000";
+    let server_url = "http://172.20.10.2:3000";
     let filesystem = RemoteFilesystem::new(server_url);
 
     #[cfg(target_os = "windows")]

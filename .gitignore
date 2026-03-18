@@ -1,3 +1,21 @@
-node_modules
-*.http
+# Rust/Cargo
 target/
+**/*.rs.bk
+Cargo.lock
+
+# Output temporanei
+*.log
+*.tmp
+
+# Coverage
+coverage/
+*.profdata
+
+# IDE/editor
+.idea/
+.vscode/
+*.swp
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
