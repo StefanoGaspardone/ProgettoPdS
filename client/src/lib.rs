@@ -5,6 +5,9 @@ use reqwest::{Url, Client};
 use serde::{Serialize, Deserialize};
 use moka::future::Cache;
 use libc::{ENOENT, EIO};
+use std::collections::HashMap;
+use std::cmp::min;
+use tokio::sync::RwLock;
 
 #[cfg(target_os = "windows")]
 pub mod dokany;
@@ -48,11 +51,54 @@ pub struct RemoteFilesystem {
     pub http_client: Client,
     pub runtime: Runtime,
     pub metadata_cache: Cache<String, (u64, FileInfo)>,
-    pub inode_cache: Cache<u64, String>,
+    pub read_cache: Cache<String, Arc<Vec<u8>>>,
+    pub path_to_inode: RwLock<HashMap<String, u64>>,
+    pub inode_to_path: RwLock<HashMap<u64, String>>,
+    pub parent_map: RwLock<HashMap<u64, u64>>,
     next_inode: AtomicU64,
 }
 
 impl RemoteFilesystem {
+    const READ_CHUNK_SIZE: usize = 1024 * 1024; // 1 MiB
+
+    fn endpoint_for_path(prefix: &str, path_clean: &str) -> String {
+        if path_clean.is_empty() {
+            prefix.to_string()
+        } else {
+            format!("{}/{}", prefix, path_clean)
+        }
+    }
+
+    async fn fetch_range(&self, path_clean: &str, offset: u64, size: usize) -> Result<Vec<u8>, i32> {
+        let url_str = format!("files/{}?offset={}&size={}", path_clean, offset, size);
+        let url = self.server_url.join(&url_str).map_err(|_| EIO)?;
+
+        let resp = self.http_client.get(url)
+            .send()
+            .await
+            .map_err(|_| EIO)?;
+
+        if !resp.status().is_success() {
+            return Err(EIO);
+        }
+
+        let bytes = resp.bytes().await.map_err(|_| EIO)?;
+        Ok(bytes.to_vec())
+    }
+
+    async fn fetch_chunk(&self, path_clean: &str, chunk_start: u64) -> Result<Arc<Vec<u8>>, i32> {
+        let chunk_key = format!("{}:{}", path_clean, chunk_start);
+
+        if let Some(cached) = self.read_cache.get(&chunk_key).await {
+            return Ok(cached);
+        }
+
+        let data = self.fetch_range(path_clean, chunk_start, Self::READ_CHUNK_SIZE).await?;
+        let chunk = Arc::new(data);
+        self.read_cache.insert(chunk_key, chunk.clone()).await;
+        Ok(chunk)
+    }
+
     pub fn new(server_url: &str) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
         let url = Url::parse(server_url)?;
         let http_client = Client::builder()
@@ -65,9 +111,9 @@ impl RemoteFilesystem {
             .time_to_live(Duration::from_secs(5)) // 5 secs
             .build();
 
-        let inode_cache = Cache::builder()
-            .max_capacity(20_000)
-            .time_to_live(Duration::from_secs(3600)) // 1 h
+        let read_cache = Cache::builder()
+            .max_capacity(256) // 256 chunks
+            .time_to_live(Duration::from_secs(20))
             .build();
 
         let fs = Arc::new(Self {
@@ -75,74 +121,122 @@ impl RemoteFilesystem {
             http_client,
             runtime,
             metadata_cache,
-            inode_cache,
+            read_cache,
+            path_to_inode: RwLock::new(HashMap::new()),
+            inode_to_path: RwLock::new(HashMap::new()),
+            parent_map: RwLock::new(HashMap::from([(1, 1)])),
             next_inode: AtomicU64::new(2),
         });
 
         fs.runtime.block_on(async {
             fs.metadata_cache.insert("".to_string(), (1, FileInfo::root())).await;
-            fs.inode_cache.insert(1, "".to_string()).await;
+            fs.path_to_inode.write().await.insert("".to_string(), 1);
+            fs.inode_to_path.write().await.insert(1, "".to_string());
         });
 
         Ok(fs)
+    }
+
+    pub async fn get_allocated_inode(&self, path: &str) -> u64 {
+        let path_clean = path.trim_start_matches('/');
+        
+        if let Some(&ino) = self.path_to_inode.read().await.get(path_clean) {
+            return ino;
+        }
+
+        let mut p2i = self.path_to_inode.write().await;
+        let mut i2p = self.inode_to_path.write().await;
+        
+        if let Some(&ino) = p2i.get(path_clean) {
+            return ino;
+        }
+
+        let ino = self.next_inode.fetch_add(1, Ordering::SeqCst);
+        p2i.insert(path_clean.to_string(), ino);
+        i2p.insert(ino, path_clean.to_string());
+        
+        ino
     }
 
     // --- API methods ---
 
     pub async fn get_stat(&self, path: &str) -> Result<(u64, FileInfo), i32> {
         let path_clean = path.trim_start_matches('/');
-        if let Some(cached) = self.metadata_cache.get(path_clean).await {
-            return Ok(cached);
+        let ino = self.get_allocated_inode(path_clean).await;
+
+        if let Some((_, cached)) = self.metadata_cache.get(path_clean).await {
+            return Ok((ino, cached));
         }
 
-        let url = self.server_url.join(&format!("stat/{}", path_clean)).map_err(|_| EIO)?;
+        let endpoint = Self::endpoint_for_path("stat", path_clean);
+        let url = self.server_url.join(&endpoint).map_err(|_| EIO)?;
         let resp = self.http_client.get(url).send().await.map_err(|_| EIO)?;
         if resp.status() == 404 { return Err(ENOENT); }
         
         let info: FileInfo = resp.json().await.map_err(|_| EIO)?;
-        let ino = self.next_inode.fetch_add(1, Ordering::SeqCst);
         
         self.metadata_cache.insert(path_clean.to_string(), (ino, info.clone())).await;
-        self.inode_cache.insert(ino, path_clean.to_string()).await;
         Ok((ino, info))
     }
 
     pub async fn list_dir(&self, path: &str) -> Result<Vec<(u64, FileInfo)>, i32> {
         let path_clean = path.trim_start_matches('/');
-        let url = self.server_url.join(&format!("list/{}", path_clean)).map_err(|_| EIO)?;
+        let endpoint = Self::endpoint_for_path("list", path_clean);
+        let url = self.server_url.join(&endpoint).map_err(|_| EIO)?;
         let resp = self.http_client.get(url).send().await.map_err(|_| EIO)?;
         let files: Vec<FileInfo> = resp.json().await.map_err(|_| EIO)?;
 
         let mut result = Vec::with_capacity(files.len());
         for file in files {
-            let ino = if let Some((cached_ino, _)) = self.metadata_cache.get(&file.path).await {
-                cached_ino
-            } else {
-                let new_ino = self.next_inode.fetch_add(1, Ordering::SeqCst);
-                self.metadata_cache.insert(file.path.clone(), (new_ino, file.clone())).await;
-                self.inode_cache.insert(new_ino, file.path.clone()).await;
-                new_ino
-            };
-            
+            let ino = self.get_allocated_inode(&file.path).await;
+            self.metadata_cache.insert(file.path.clone(), (ino, file.clone())).await;
             result.push((ino, file));
         }
+
         Ok(result)
     }
 
     pub async fn read_file(&self, path: &str, offset: u64, size: u32) -> Result<Vec<u8>, i32> {
         let path_clean = path.trim_start_matches('/');
-        let url_str = format!("files/{}?offset={}&size={}", path_clean, offset, size);
-        let url = self.server_url.join(&url_str).map_err(|_| EIO)?;
+        
+        if size == 0 {
+            return Ok(Vec::new());
+        }
 
-        let resp = self.http_client.get(url)
-            .send()
-            .await
-            .map_err(|_| EIO)?;
+        let requested = size as usize;
+        
+        let mut out = Vec::with_capacity(requested);
+        let mut remaining = requested;
+        let mut current_offset = offset;
 
-        if !resp.status().is_success() { return Err(EIO); }
+        while remaining > 0 {
+            let chunk_start = (current_offset / Self::READ_CHUNK_SIZE as u64) * Self::READ_CHUNK_SIZE as u64;
+            let offset_in_chunk = (current_offset - chunk_start) as usize;
+            let chunk = match self.fetch_chunk(path_clean, chunk_start).await {
+                Ok(cached) => cached,
+                Err(_) => {
+                    // Robust fallback: if chunk prefetch fails, serve exact range requested by FUSE.
+                    self.read_cache.invalidate_all();
+                    return self.fetch_range(path_clean, offset, requested).await;
+                }
+            };
 
-        let data = resp.bytes().await.map_err(|_| EIO)?;
-        Ok(data.to_vec())
+            if offset_in_chunk >= chunk.len() {
+                break;
+            }
+
+            let to_take = min(remaining, chunk.len() - offset_in_chunk);
+            out.extend_from_slice(&chunk[offset_in_chunk..offset_in_chunk + to_take]);
+
+            remaining -= to_take;
+            current_offset += to_take as u64;
+
+            if to_take == 0 || chunk.len() < Self::READ_CHUNK_SIZE {
+                break;
+            }
+        }
+
+        Ok(out)
     }
 
     pub async fn write_file(&self, path: &str, offset: u64, data: Vec<u8>) -> Result<(), i32> {
@@ -158,6 +252,8 @@ impl RemoteFilesystem {
 
         if resp.status().is_success() {
             self.metadata_cache.remove(path_clean).await;
+            self.read_cache.invalidate_all();
+            
             Ok(())
         } else {
             Err(EIO)
@@ -179,6 +275,8 @@ impl RemoteFilesystem {
         let resp = self.http_client.delete(url).send().await.map_err(|_| EIO)?;
         if resp.status().is_success() || resp.status() == 204 {
             self.metadata_cache.remove(path_clean).await;
+            self.read_cache.invalidate_all();
+            
             Ok(())
         } else {
             Err(EIO)
@@ -188,6 +286,7 @@ impl RemoteFilesystem {
     pub async fn rename(&self, old_path: &str, new_path: &str) -> Result<(), i32> {
         let old_clean = old_path.trim_start_matches('/');
         let new_clean = new_path.trim_start_matches('/');
+        
         let url = self.server_url.join(&format!("rename/{}", old_clean)).map_err(|_| EIO)?;
 
         let resp = self.http_client.post(url)
@@ -201,8 +300,20 @@ impl RemoteFilesystem {
                 
                 self.metadata_cache.remove(old_clean).await;
                 self.metadata_cache.insert(new_clean.to_string(), (ino, new_info)).await;
-                self.inode_cache.insert(ino, new_clean.to_string()).await;
+            } else {
+                self.metadata_cache.remove(old_clean).await;
             }
+
+            let mut p2i = self.path_to_inode.write().await;
+            let mut i2p = self.inode_to_path.write().await;
+            
+            if let Some(ino) = p2i.remove(old_clean) {
+                p2i.insert(new_clean.to_string(), ino);
+                i2p.insert(ino, new_clean.to_string());
+            }
+
+            self.read_cache.invalidate_all();
+
             Ok(())
         } else {
             Err(EIO)
@@ -212,6 +323,6 @@ impl RemoteFilesystem {
     // --- UTILS ---
 
     pub async fn get_path_by_ino(&self, ino: u64) -> Option<String> {
-        self.inode_cache.get(&ino).await
+        self.inode_to_path.read().await.get(&ino).cloned()
     }
 }

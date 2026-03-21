@@ -1,5 +1,5 @@
 use fuser::{
-    Config, Errno, FileAttr, FileHandle, FileType, Filesystem, Generation, INodeNo, LockOwner, MountOption, OpenFlags, RenameFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyWrite, Request, WriteFlags, mount2
+    Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, LockOwner, MountOption, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, WriteFlags, mount2
 };
 use std::ffi::OsStr;
 use std::time::{Duration, SystemTime};
@@ -82,11 +82,16 @@ impl Filesystem for FuseAdapter {
                         }
 
                         if curr_offset == 1 {
-                            if reply.add(ino, 2, FileType::Directory, "..") { return reply.ok(); }
+                            let parent_ino = *self.fs.parent_map.read().await.get(&ino.into()).unwrap_or(&1);
+                            
+                            if reply.add(INodeNo(parent_ino), 2, FileType::Directory, "..") { return reply.ok(); }
+                            
                             curr_offset = 2;
                         }
 
                         for (i, (f_ino, f_info)) in entries.into_iter().enumerate().skip((curr_offset - 2) as usize) {
+                            self.fs.parent_map.write().await.insert(f_ino, ino.into());
+                            
                             let kind = if f_info.file_type == "dir" { FileType::Directory } else { FileType::RegularFile };
                             let next_o = (i as u64) + 3;
                             
@@ -94,6 +99,7 @@ impl Filesystem for FuseAdapter {
                                 break;
                             }
                         }
+
                         reply.ok();
                     }
                     Err(e) => reply.error(Errno::from_i32(e)),
@@ -128,6 +134,38 @@ impl Filesystem for FuseAdapter {
                 reply.error(Errno::from_i32(ENOENT));
             }
         });
+    }
+
+    fn create(&self, _req: &Request, parent: INodeNo, name: &OsStr, _mode: u32, _umask: u32, _flags: i32, reply: ReplyCreate) {
+        let name_str = name.to_string_lossy();
+        self.fs.runtime.block_on(async {
+            if let Some(parent_path) = self.fs.get_path_by_ino(parent.into()).await {
+                let full_path = if parent_path.is_empty() {
+                    name_str.to_string()
+                } else {
+                    format!("{}/{}", parent_path.trim_end_matches('/'), name_str)
+                };
+
+                match self.fs.write_file(&full_path, 0, vec![]).await {
+                    Ok(_) => {
+                        match self.fs.get_stat(&full_path).await {
+                            Ok((ino, info)) => {
+                                let attr = self.make_attr(INodeNo(ino), &info);
+                                reply.created(&TTL, &attr, Generation(0), FileHandle(0), FopenFlags::empty());
+                            }
+                            Err(e) => reply.error(Errno::from_i32(e)),
+                        }
+                    }
+                    Err(e) => reply.error(Errno::from_i32(e)),
+                }
+            } else {
+                reply.error(Errno::from_i32(ENOENT));
+            }
+        });
+    }
+
+    fn open(&self, _req: &Request, _ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        reply.opened(FileHandle(0), FopenFlags::empty());
     }
 
     fn mkdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, _mode: u32, _umask: u32, reply: ReplyEntry) {
@@ -201,13 +239,13 @@ impl FuseAdapter {
 }
 
 pub fn run_fuser_client(fs: Arc<RemoteFilesystem>, mountpoint: String) {
-    let adapter = FuseAdapter { fs };
-    
+    let _ = std::fs::create_dir_all(&mountpoint);
+
     let mut options = Config::default();
     options.mount_options = vec![
         MountOption::RW,
-        MountOption::FSName("remote-axum".to_string()),
+        MountOption::FSName("remote-file-system".to_string()),
     ];
-    
-    mount2(adapter, mountpoint, &options).expect("Mount failed");
+
+    mount2(FuseAdapter { fs }, &mountpoint, &options).expect("Mount failed");
 }
