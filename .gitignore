@@ -19,3 +19,9 @@ coverage/
 # Sistema operativo
 .DS_Store
 Thumbs.db
+
+# .env
+.env
+
+# Remote File System
+server/mnt/
