@@ -1,12 +1,17 @@
-use fuser::{Filesystem, mount2, Request, ReplyAttr, ReplyData, ReplyDirectory, FileAttr, FileType, ReplyEmpty, MountOption};
-use libc::{EEXIST, EINVAL, ENOENT, EIO};
-use std::ffi::{OsStr, OsString};
-use std::{process, thread};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+struct ApiClient {
+    server_url: reqwest::Url,
+    client: reqwest::Client,
+}
 
-use crate::{RemoteFilesystem, FileInfo};
+impl ApiClient {
+    async fn fetch_info(&self, path: &str) -> Result<FileInfo, i32> {
+        self.client.get(self.server_url.join(&format!("/stat/{}", path)).unwrap())
+            .send().await
+            .map_err(|_| EIO)?
+            .json().await
+            .map_err(|_| EIO)
+    }
+}
 
 pub const FUSE_ROOT_ID: u64 = 1;
 const TTL: Duration = Duration::from_secs(1);
