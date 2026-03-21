@@ -171,13 +171,12 @@ async fn write_file(path: Option<Path<String>>, Query(params): Query<ReadParams>
     let mut file = match fs::OpenOptions::new()
         .write(true)
         .create(true)
-        .truncate(params.offset.is_none())
+        .truncate(params.offset.is_none()) 
         .open(&full_path)
-        .await 
-    {
-        Ok(f) => f,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    };
+        .await {
+            Ok(f) => f,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
 
     if let Some(offset) = params.offset {
         if let Err(_) = file.seek(std::io::SeekFrom::Start(offset)).await {
@@ -256,28 +255,21 @@ async fn delete_file(path: Option<Path<String>>) -> impl IntoResponse {
     }
 }
 
-async fn rename_file(path: Path<String>, Json(payload): Json<RenameRequest>) -> impl IntoResponse {
-    let old_relative = path.trim_start_matches('/');
-    let new_relative = payload.new_path.trim_start_matches('/');
+async fn rename_file(Path(old_path): Path<String>, Json(payload): Json<RenameRequest>) -> impl IntoResponse {
+    let old_clean = old_path.trim_start_matches('/');
+    let new_clean = payload.new_path.trim_start_matches('/');
 
-    println!("\n[DELETE /files] /{} to {}", old_relative, new_relative);
+    println!("\n[DELETE /files] /{} to {}", old_clean, new_clean);
 
-    let old_full = PathBuf::from(STORAGE_ROOT).join(old_relative);
-    let new_full = PathBuf::from(STORAGE_ROOT).join(new_relative);
+    let old_full = PathBuf::from(STORAGE_ROOT).join(old_clean);
+    let new_full = PathBuf::from(STORAGE_ROOT).join(new_clean);
 
     if let Some(parent) = new_full.parent() {
-        if !parent.exists() {
-            return (
-                StatusCode::NOT_FOUND,
-                "Destination folder does not exist"
-            ).into_response();
-        }
+        let _ = fs::create_dir_all(parent).await; 
     }
 
     match fs::rename(&old_full, &new_full).await {
-        Ok(_) => {
-            StatusCode::OK.into_response()
-        },
+        Ok(_) => StatusCode::OK.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
