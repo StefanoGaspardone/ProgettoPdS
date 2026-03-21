@@ -294,7 +294,7 @@ async fn main() {
 
     let root_path = PathBuf::from(STORAGE_ROOT);
     if!root_path.exists() {
-        eprintln!("ERROR: storage directory '{}' does not exist, creating it...", root_path.display());
+        eprintln!("WARNING: storage directory '{}' does not exist, creating it...", root_path.display());
         fs::create_dir_all(&root_path).await.unwrap();
     }
 
