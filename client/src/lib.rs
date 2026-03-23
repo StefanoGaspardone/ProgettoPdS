@@ -1,6 +1,7 @@
 use std::sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}};
 use std::time::Duration;
-use tokio::runtime::Runtime;
+use std::sync::OnceLock;
+use tokio::runtime::{Handle, Runtime};
 use reqwest::{Url, Client};
 use serde::{Serialize, Deserialize};
 use moka::future::Cache;
@@ -8,6 +9,11 @@ use libc::{ECONNREFUSED, EIO, ENOENT, ENOTCONN, ETIMEDOUT};
 use std::collections::HashMap;
 use std::cmp::min;
 use tokio::sync::RwLock;
+
+fn global_runtime() -> &'static Runtime {
+    static RUNTIME: OnceLock<Runtime> = OnceLock::new();
+    RUNTIME.get_or_init(|| Runtime::new().expect("failed to create tokio runtime"))
+}
 
 #[cfg(target_os = "windows")]
 pub mod dokany;
@@ -49,7 +55,7 @@ struct RenameRequest {
 pub struct RemoteFilesystem {
     pub server_url: Url,
     pub http_client: Client,
-    pub runtime: Runtime,
+    pub runtime_handle: Handle,
     pub metadata_cache: Cache<String, (u64, FileInfo)>,
     pub read_cache: Cache<String, Arc<Vec<u8>>>,
     pub path_to_inode: RwLock<HashMap<String, u64>>,
@@ -108,7 +114,8 @@ impl RemoteFilesystem {
             .connect_timeout(Duration::from_secs(2))
             .build()?;
         
-        let runtime = Runtime::new()?;
+        let runtime = global_runtime();
+        let runtime_handle = runtime.handle().clone();
         let is_online = Arc::new(AtomicBool::new(true));
 
         let metadata_cache = Cache::builder()
@@ -117,14 +124,16 @@ impl RemoteFilesystem {
             .build();
 
         let read_cache = Cache::builder()
-            .max_capacity(256) // 256 chunks
+            .max_capacity(1024) // 1024 chunks
             .time_to_live(Duration::from_secs(20))
             .build();
+
+        let health_runtime_handle = runtime_handle.clone();
 
         let fs = Arc::new(Self {
             server_url: url,
             http_client,
-            runtime,
+            runtime_handle,
             metadata_cache,
             read_cache,
             path_to_inode: RwLock::new(HashMap::new()),
@@ -135,7 +144,7 @@ impl RemoteFilesystem {
         });
         
         let fs_check = fs.clone();
-        tokio::spawn(async move {
+        health_runtime_handle.spawn(async move {
             let health_url = fs_check.server_url.join("health").unwrap();
             let mut was_online = true; 
 

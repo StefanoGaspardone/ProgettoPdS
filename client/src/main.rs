@@ -24,14 +24,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  > Server: {}", server_address);
     println!("  > Mount:  {}", mount_point);
 
-    let mp_handler = mount_point.clone();
-
     ctrlc::set_handler(move || {
         println!("\n[SIGINT] Shutdown starting...");
         
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             use std::process::Command;
+    
+            let mp_handler = mount_point.clone();
 
             let _ = Command::new("fusermount")
                 .arg("-u")
@@ -47,7 +47,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fs = loop {
         match RemoteFilesystem::new(&server_address) {
             Ok(fs_instance) => {
-                let is_alive = fs_instance.runtime.block_on(async {
+                let is_alive = fs_instance.runtime_handle.block_on(async {
                     let health_url = fs_instance.server_url.join("health").ok()?;
                     
                     fs_instance.http_client.get(health_url)
