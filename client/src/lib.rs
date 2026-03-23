@@ -136,8 +136,8 @@ impl RemoteFilesystem {
             runtime_handle,
             metadata_cache,
             read_cache,
-            path_to_inode: RwLock::new(HashMap::new()),
-            inode_to_path: RwLock::new(HashMap::new()),
+            path_to_inode: RwLock::new(HashMap::from([(String::new(), 1)])),
+            inode_to_path: RwLock::new(HashMap::from([(1, String::new())])),
             parent_map: RwLock::new(HashMap::from([(1, 1)])),
             next_inode: AtomicU64::new(2),
             is_online: is_online.clone(),
@@ -159,8 +159,6 @@ impl RemoteFilesystem {
                     println!("[HEALTH] Server back online: caches cleared for consistency.");
                 }
 
-                
-                
                 if was_online && !now_online {
                     println!("\n[HEALTH] Server went OFFLINE! Requests will fail fast.");
                 }
@@ -391,6 +389,10 @@ impl RemoteFilesystem {
     // --- UTILS ---
 
     pub async fn get_path_by_ino(&self, ino: u64) -> Option<String> {
+        if ino == 1 {
+            return Some(String::new());
+        }
+
         self.inode_to_path.read().await.get(&ino).cloned()
     }
 }
