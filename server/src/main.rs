@@ -50,6 +50,10 @@ fn get_local_ip_address() -> IpAddr {
     my_local_ip
 }
 
+async fn health() -> impl IntoResponse {
+    StatusCode::OK.into_response()
+}
+
 async fn list_dir(path: Option<Path<String>>) -> Json<Vec<FileInfo>> {
     let dir_path = path.map(|Path(p)| p).unwrap_or_default();
     let relative_path = dir_path.trim_start_matches('/');
@@ -291,6 +295,8 @@ async fn main() {
     }
 
     let app = Router::new()
+        .route("/health", get(health)) // GET /health
+
         .route("/list", get(list_dir)) // GET /list
         .route("/list/{*path}", get(list_dir))
 

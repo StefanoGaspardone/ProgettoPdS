@@ -1,5 +1,5 @@
 use dotenvy::dotenv;
-use std::{env, process};
+use std::{env, process, thread, time::Duration};
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::fs::create_dir_all;
@@ -44,7 +44,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         process::exit(0);
     }).expect("[SIGNINT] Handler failed to setup");
 
-    let fs = RemoteFilesystem::new(&server_address)?;
+    let fs = loop {
+        match RemoteFilesystem::new(&server_address) {
+            Ok(fs_instance) => {
+                let is_alive = fs_instance.runtime.block_on(async {
+                    let health_url = fs_instance.server_url.join("health").ok()?;
+                    
+                    fs_instance.http_client.get(health_url)
+                        .timeout(Duration::from_secs(2))
+                        .send()
+                        .await
+                        .ok()?
+                        .status()
+                        .is_success()
+                        .then(|| ())
+                });
+
+                if is_alive.is_some() {
+                    println!("  > [OK] Server online and reached");
+                    break fs_instance;
+                }
+            }
+            Err(e) => {
+                println!("  > [WARN] Init error: {}", e);
+            }
+        }
+        println!("  > [RETRY] Server unavailable, retrying in 5 seconds...");
+        thread::sleep(Duration::from_secs(5));
+    };
 
     #[cfg(target_os = "windows")]
     {
