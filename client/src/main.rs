@@ -24,6 +24,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  > Server: {}", server_address);
     println!("  > Mount:  {}", mount_point);
 
+    let mount_point_for_signal = mount_point.clone();
+
     ctrlc::set_handler(move || {
         println!("\n[SIGINT] Shutdown starting...");
         
@@ -31,7 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             use std::process::Command;
     
-            let mp_handler = mount_point.clone();
+            let mp_handler = mount_point_for_signal.clone();
 
             let _ = Command::new("fusermount")
                 .arg("-u")

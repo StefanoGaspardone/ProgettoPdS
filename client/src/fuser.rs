@@ -37,7 +37,7 @@ impl FuseAdapter {
 
 impl Filesystem for FuseAdapter {
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
-        self.fs.runtime.block_on(async {
+        self.fs.runtime_handle.block_on(async {
             if let Some(path) = self.fs.get_path_by_ino(ino.into()).await {
                 match self.fs.get_stat(&path).await {
                     Ok((res_ino, info)) => reply.attr(&TTL, &self.make_attr(INodeNo(res_ino), &info)),
@@ -51,7 +51,7 @@ impl Filesystem for FuseAdapter {
 
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let name_str = name.to_string_lossy();
-        self.fs.runtime.block_on(async {
+        self.fs.runtime_handle.block_on(async {
             if let Some(parent_path) = self.fs.get_path_by_ino(parent.into()).await {
                 let full_path = if parent_path.is_empty() || parent_path == "/" {
                     name_str.to_string()
@@ -70,7 +70,7 @@ impl Filesystem for FuseAdapter {
     }
 
     fn readdir(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64, mut reply: ReplyDirectory) {
-        self.fs.runtime.block_on(async {
+        self.fs.runtime_handle.block_on(async {
             if let Some(path) = self.fs.get_path_by_ino(ino.into()).await {
                 match self.fs.list_dir(&path).await {
                     Ok(entries) => {
@@ -111,7 +111,7 @@ impl Filesystem for FuseAdapter {
     }
 
     fn read(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64, size: u32, _flags: OpenFlags, _lock: Option<LockOwner>, reply: ReplyData) {
-        self.fs.runtime.block_on(async {
+        self.fs.runtime_handle.block_on(async {
             if let Some(path) = self.fs.get_path_by_ino(ino.into()).await {
                 match self.fs.read_file(&path, offset as u64, size).await {
                     Ok(data) => reply.data(&data),
@@ -124,7 +124,7 @@ impl Filesystem for FuseAdapter {
     }
 
     fn write(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64, data: &[u8], _write_flags: WriteFlags, _flags: OpenFlags, _lock: Option<LockOwner>, reply: ReplyWrite) {
-        self.fs.runtime.block_on(async {
+        self.fs.runtime_handle.block_on(async {
             if let Some(path) = self.fs.get_path_by_ino(ino.into()).await {
                 match self.fs.write_file(&path, offset as u64, data.to_vec()).await {
                     Ok(_) => reply.written(data.len() as u32),
@@ -137,8 +137,8 @@ impl Filesystem for FuseAdapter {
     }
 
     fn create(&self, _req: &Request, parent: INodeNo, name: &OsStr, _mode: u32, _umask: u32, _flags: i32, reply: ReplyCreate) {
-        let name_str = name.to_string_lossy();
-        self.fs.runtime.block_on(async {
+        let name_str: std::borrow::Cow<'_, str> = name.to_string_lossy();
+        self.fs.runtime_handle.block_on(async {
             if let Some(parent_path) = self.fs.get_path_by_ino(parent.into()).await {
                 let full_path = if parent_path.is_empty() {
                     name_str.to_string()
@@ -171,7 +171,7 @@ impl Filesystem for FuseAdapter {
     fn mkdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, _mode: u32, _umask: u32, reply: ReplyEntry) {
         let name_str = name.to_string_lossy();
         
-        self.fs.runtime.block_on(async {
+        self.fs.runtime_handle.block_on(async {
             if let Some(parent_path) = self.fs.get_path_by_ino(parent.into()).await {
                 let full_path = format!("{}/{}", parent_path.trim_end_matches('/'), name_str);
                 
@@ -192,7 +192,7 @@ impl Filesystem for FuseAdapter {
         let name_str = name.to_string_lossy();
         let newname_str = newname.to_string_lossy();
 
-        self.fs.runtime.block_on(async {
+        self.fs.runtime_handle.block_on(async {
             let old_p = self.fs.get_path_by_ino(parent.into()).await;
             let new_p = self.fs.get_path_by_ino(newparent.into()).await;
 
@@ -223,7 +223,7 @@ impl FuseAdapter {
     fn remove_any(&self, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let name_str = name.to_string_lossy();
         
-        self.fs.runtime.block_on(async {
+        self.fs.runtime_handle.block_on(async {
             if let Some(parent_path) = self.fs.get_path_by_ino(parent.into()).await {
                 let full_path = format!("{}/{}", parent_path.trim_end_matches('/'), name_str);
                 

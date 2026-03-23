@@ -158,6 +158,12 @@ impl RemoteFilesystem {
                     
                     println!("[HEALTH] Server back online: caches cleared for consistency.");
                 }
+
+                
+                
+                if was_online && !now_online {
+                    println!("\n[HEALTH] Server went OFFLINE! Requests will fail fast.");
+                }
                 
                 fs_check.is_online.store(now_online, Ordering::SeqCst);
                 
