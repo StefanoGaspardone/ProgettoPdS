@@ -8,7 +8,8 @@ use moka::future::Cache;
 use libc::{ECONNREFUSED, EIO, ENOENT, ENOTCONN, ETIMEDOUT};
 use std::collections::HashMap;
 use std::cmp::min;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
+use tokio::task::JoinHandle;
 
 fn global_runtime() -> &'static Runtime {
     static RUNTIME: OnceLock<Runtime> = OnceLock::new();
@@ -62,6 +63,8 @@ pub struct RemoteFilesystem {
     pub inode_to_path: RwLock<HashMap<u64, String>>,
     pub parent_map: RwLock<HashMap<u64, u64>>,
     pub is_online: Arc<AtomicBool>,
+    shutdown: Arc<AtomicBool>,
+    health_task: Mutex<Option<JoinHandle<()>>>,
     next_inode: AtomicU64,
 }
 
@@ -117,6 +120,7 @@ impl RemoteFilesystem {
         let runtime = global_runtime();
         let runtime_handle = runtime.handle().clone();
         let is_online = Arc::new(AtomicBool::new(true));
+        let shutdown = Arc::new(AtomicBool::new(false));
 
         let metadata_cache = Cache::builder()
             .max_capacity(10_000)
@@ -124,8 +128,8 @@ impl RemoteFilesystem {
             .build();
 
         let read_cache = Cache::builder()
-            .max_capacity(1024) // 1024 chunks
-            .time_to_live(Duration::from_secs(20))
+            .max_capacity(512) // 512 MB
+            .time_to_idle(Duration::from_secs(10))
             .build();
 
         let health_runtime_handle = runtime_handle.clone();
@@ -141,14 +145,20 @@ impl RemoteFilesystem {
             parent_map: RwLock::new(HashMap::from([(1, 1)])),
             next_inode: AtomicU64::new(2),
             is_online: is_online.clone(),
+            shutdown: shutdown.clone(),
+            health_task: Mutex::new(None),
         });
         
         let fs_check = fs.clone();
-        health_runtime_handle.spawn(async move {
+        let health_handle = health_runtime_handle.spawn(async move {
             let health_url = fs_check.server_url.join("health").unwrap();
             let mut was_online = true; 
 
             loop {
+                if fs_check.shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+
                 let res = fs_check.http_client.get(health_url.clone()).send().await;
                 let now_online = res.is_ok() && res.unwrap().status().is_success();
                 
@@ -172,7 +182,22 @@ impl RemoteFilesystem {
             }
         });
 
+        fs.runtime_handle.block_on(async {
+            let mut slot = fs.health_task.lock().await;
+            *slot = Some(health_handle);
+        });
+
         Ok(fs)
+    }
+
+    pub async fn shutdown_background_tasks(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+
+        let mut slot = self.health_task.lock().await;
+        if let Some(handle) = slot.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
     }
 
     pub async fn get_allocated_inode(&self, path: &str) -> u64 {
@@ -243,37 +268,25 @@ impl RemoteFilesystem {
     }
 
     pub async fn read_file(&self, path: &str, offset: u64, size: u32) -> Result<Vec<u8>, i32> {
-        if !self.is_online.load(Ordering::SeqCst) {
-            return Err(ENOTCONN); 
-        }
-
+        if !self.is_online.load(Ordering::SeqCst) { return Err(ENOTCONN); }
         let path_clean = path.trim_start_matches('/');
-        
-        if size == 0 {
-            return Ok(Vec::new());
-        }
+        if size == 0 { return Ok(Vec::new()); }
 
         let requested = size as usize;
-        
         let mut out = Vec::with_capacity(requested);
-        let mut remaining = requested;
         let mut current_offset = offset;
+        let mut remaining = requested;
 
         while remaining > 0 {
             let chunk_start = (current_offset / Self::READ_CHUNK_SIZE as u64) * Self::READ_CHUNK_SIZE as u64;
             let offset_in_chunk = (current_offset - chunk_start) as usize;
-            
-            let chunk = match self.fetch_chunk(path_clean, chunk_start).await {
-                Ok(cached) => cached,
-                Err(_) => {
-                    self.read_cache.invalidate_all();
-                    return self.fetch_range(path_clean, offset, requested).await;
-                }
-            };
 
-            if offset_in_chunk >= chunk.len() {
-                break;
-            }
+            let chunk = self.fetch_chunk(path_clean, chunk_start).await?;
+
+            let next_chunk_start = chunk_start + Self::READ_CHUNK_SIZE as u64;
+            self.prefetch_next_chunk(path_clean.to_string(), next_chunk_start).await;
+
+            if offset_in_chunk >= chunk.len() { break; }
 
             let to_take = min(remaining, chunk.len() - offset_in_chunk);
             out.extend_from_slice(&chunk[offset_in_chunk..offset_in_chunk + to_take]);
@@ -281,9 +294,7 @@ impl RemoteFilesystem {
             remaining -= to_take;
             current_offset += to_take as u64;
 
-            if to_take == 0 || chunk.len() < Self::READ_CHUNK_SIZE {
-                break;
-            }
+            if chunk.len() < Self::READ_CHUNK_SIZE { break; }
         }
 
         Ok(out)
@@ -394,6 +405,38 @@ impl RemoteFilesystem {
         }
 
         self.inode_to_path.read().await.get(&ino).cloned()
+    }
+
+    async fn prefetch_next_chunk(&self, path_clean: String, next_chunk_start: u64) {
+        if self.shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+
+        let chunk_key = format!("{}:{}", path_clean, next_chunk_start);
+        
+        if self.read_cache.get(&chunk_key).await.is_none() {
+            let self_clone = self.http_client.clone();
+            let url_base = self.server_url.clone();
+            let cache = self.read_cache.clone();
+            let shutdown = self.shutdown.clone();
+            
+            self.runtime_handle.spawn(async move {
+                if shutdown.load(Ordering::SeqCst) {
+                    return;
+                }
+
+                let url_str = format!("files/{}?offset={}&size={}", path_clean, next_chunk_start, Self::READ_CHUNK_SIZE);
+                if let Ok(url) = url_base.join(&url_str) {
+                    if let Ok(resp) = self_clone.get(url).send().await {
+                        if resp.status().is_success() {
+                            if let Ok(bytes) = resp.bytes().await {
+                                cache.insert(chunk_key, Arc::new(bytes.to_vec())).await;
+                            }
+                        }
+                    }
+                }
+            });
+        }
     }
 }
 

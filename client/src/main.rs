@@ -24,28 +24,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  > Server: {}", server_address);
     println!("  > Mount:  {}", mount_point);
 
-    let mount_point_for_signal = mount_point.clone();
-
-    ctrlc::set_handler(move || {
-        println!("\n[SIGINT] Shutdown starting...");
-        
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        {
-            use std::process::Command;
-    
-            let mp_handler = mount_point_for_signal.clone();
-
-            let _ = Command::new("fusermount")
-                .arg("-u")
-                .arg("-z")
-                .arg(&mp_handler)
-                .output();
-        }
-
-        println!("FILE SYSTEM SHUT DOWN GRACEFULLY");
-        process::exit(0);
-    }).expect("[SIGNINT] Handler failed to setup");
-
     let fs = loop {
         match RemoteFilesystem::new(&server_address) {
             Ok(fs_instance) => {
@@ -74,6 +52,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  > [RETRY] Server unavailable, retrying in 5 seconds...");
         thread::sleep(Duration::from_secs(5));
     };
+
+    let fs_for_signal = fs.clone();
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let mount_point_for_signal = mount_point.clone();
+    }
+
+    ctrlc::set_handler(move || {
+        println!("\n[SIGINT] Shutdown starting...");
+
+        fs_for_signal.runtime_handle.block_on(async {
+            fs_for_signal.shutdown_background_tasks().await;
+        });
+        
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            use std::process::Command;
+
+            let _ = Command::new("fusermount")
+                .arg("-u")
+                .arg("-z")
+                .arg(&mount_point_for_signal)
+                .output();
+        }
+
+        println!("FILE SYSTEM SHUT DOWN GRACEFULLY");
+        process::exit(0);
+    }).expect("[SIGNINT] Handler failed to setup");
 
     #[cfg(target_os = "windows")]
     {
