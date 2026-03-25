@@ -39,7 +39,9 @@ struct RenameRequest {
     new_path: String,
 }
 
-const STORAGE_ROOT: &str = "mnt/remote-fs";
+fn storage_root() -> PathBuf {
+    PathBuf::from(env::var("STORAGE_ROOT").unwrap_or_else(|_| "mnt/remote-fs".to_string()))
+}
 
 fn get_local_ip_address() -> IpAddr {
     let my_local_ip = local_ip().unwrap_or_else(|_| {
@@ -60,7 +62,7 @@ async fn list_dir(path: Option<Path<String>>) -> Json<Vec<FileInfo>> {
 
     println!("\n[GET /list] /{}", relative_path);
 
-    let full_path = PathBuf::from(STORAGE_ROOT).join(relative_path);
+    let full_path = storage_root().join(relative_path);
     let mut files = Vec::new();
 
     let mut entries = match fs::read_dir(&full_path).await {
@@ -102,7 +104,7 @@ async fn read_file(path: Option<Path<String>>, Query(params): Query<ReadParams>)
     let file_path = path.map(|Path(p)| p).unwrap_or_default();
     let relative_path = file_path.trim_start_matches('/');
 
-    let full_path = PathBuf::from(STORAGE_ROOT).join(relative_path);
+    let full_path = storage_root().join(relative_path);
 
     let mut file = match fs::File::open(&full_path).await {
         Ok(f) => f,
@@ -133,7 +135,7 @@ async fn get_stat(path: Option<Path<String>>) -> impl IntoResponse {
 
     println!("\n[GET /stat] /{}", relative_path);
 
-    let full_path = PathBuf::from(STORAGE_ROOT).join(relative_path);
+    let full_path = storage_root().join(relative_path);
 
     match fs::metadata(&full_path).await {
         Ok(metadata) => {
@@ -170,7 +172,7 @@ async fn write_file(path: Option<Path<String>>, Query(params): Query<ReadParams>
 
     println!("\n[PUT /files] /{} with body: {:?} and offset: {:?}", relative_path, body, params.offset);
 
-    let full_path = PathBuf::from(STORAGE_ROOT).join(relative_path);
+    let full_path = storage_root().join(relative_path);
 
     let mut file = match fs::OpenOptions::new()
         .write(true)
@@ -215,7 +217,7 @@ async fn create_dir(path: Option<Path<String>>) -> impl IntoResponse {
 
     println!("\n[POST /mkdir] /{}", relative_path);
 
-    let full_path = PathBuf::from(STORAGE_ROOT).join(relative_path);
+    let full_path = storage_root().join(relative_path);
 
     match fs::create_dir_all(&full_path).await {
         Ok(_) => {
@@ -238,7 +240,7 @@ async fn delete_file(path: Option<Path<String>>) -> impl IntoResponse {
 
     println!("\n[DELETE /files] /{}", relative_path);
 
-    let full_path = PathBuf::from(STORAGE_ROOT).join(relative_path);
+    let full_path = storage_root().join(relative_path);
 
     let metadata = match fs::metadata(&full_path).await {
         Ok(m) => m,
@@ -265,8 +267,8 @@ async fn rename_file(Path(old_path): Path<String>, Json(payload): Json<RenameReq
 
     println!("\n[DELETE /files] /{} to {}", old_clean, new_clean);
 
-    let old_full = PathBuf::from(STORAGE_ROOT).join(old_clean);
-    let new_full = PathBuf::from(STORAGE_ROOT).join(new_clean);
+    let old_full = storage_root().join(old_clean);
+    let new_full = storage_root().join(new_clean);
 
     if let Some(parent) = new_full.parent() {
         let _ = fs::create_dir_all(parent).await; 
@@ -288,7 +290,7 @@ async fn main() {
 
     let addr = SocketAddr::new(get_local_ip_address(), port);
 
-    let root_path = PathBuf::from(STORAGE_ROOT);
+    let root_path = storage_root();
     if!root_path.exists() {
         eprintln!("WARNING: storage directory '{}' does not exist, creating it...", root_path.display());
         fs::create_dir_all(&root_path).await.unwrap();
@@ -312,7 +314,7 @@ async fn main() {
         .route("/rename/{*path}", post(rename_file)); // POST /rename
 
     println!("SERVER LISTENING ON http://{}:{}", addr.ip(), addr.port());
-    println!("STORAGE DIRECTORY: {}", STORAGE_ROOT);
+    println!("STORAGE DIRECTORY: {}", root_path.display());
 
     let listener = TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app)
