@@ -7,6 +7,10 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::sync::Arc;
+#[cfg(target_os = "windows")]
+use std::sync::{Mutex, MutexGuard, OnceLock};
+#[cfg(target_os = "windows")]
+use widestring::U16CString;
 use local_ip_address::local_ip;
 use client::RemoteFilesystem; 
 
@@ -14,6 +18,12 @@ use client::RemoteFilesystem;
 use client::fuser::run_fuser_client;
 #[cfg(target_os = "windows")]
 use client::dokany::run_dokany_client;
+
+#[cfg(target_os = "windows")]
+fn dokan_test_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
 
 struct ChildGuard {
     child: Child,
@@ -59,10 +69,15 @@ pub struct TestEnvironment {
     _mount_dir: TempDirGuard,
     _server_child: ChildGuard,
     fs_instance: Arc<RemoteFilesystem>,
+    #[cfg(target_os = "windows")]
+    _dokan_guard: MutexGuard<'static, ()>,
 }
 
 impl TestEnvironment {
     pub fn new() -> Self {
+        #[cfg(target_os = "windows")]
+        let dokan_guard = dokan_test_lock().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
         let host = local_ip().unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
         let port = find_free_port(host);
         let server_storage = make_temp_dir("server-storage");
@@ -115,6 +130,8 @@ impl TestEnvironment {
             _mount_dir: mount_dir,
             _server_child: server_child,
             fs_instance,
+            #[cfg(target_os = "windows")]
+            _dokan_guard: dokan_guard,
         }
     }
 }
@@ -128,6 +145,13 @@ impl Drop for TestEnvironment {
                 .arg("-z")
                 .arg(&self.mount_point)
                 .output();
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            if let Ok(mp) = U16CString::from_os_str(&self.mount_point) {
+                let _ = dokan::unmount(&mp);
+            }
         }
 
         self.fs_instance.runtime_handle.block_on(async {
