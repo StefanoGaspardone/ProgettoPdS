@@ -56,9 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fs_for_signal = fs.clone();
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    {
-        let mount_point_for_signal = mount_point.clone();
-    }
+    let mount_point_for_signal = mount_point.clone();
 
     ctrlc::set_handler(move || {
         println!("\n[SIGINT] Shutdown starting...");
