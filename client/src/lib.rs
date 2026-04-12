@@ -460,8 +460,8 @@ impl RemoteFilesystem {
         }
 
         let chunk_key = format!("{}:{}", path_clean, next_chunk_start);
-        
-        if self.read_cache.contains_key(&chunk_key) {
+    
+        if self.read_cache.get(&chunk_key).await.is_some() {
             return;
         }
 
@@ -473,17 +473,20 @@ impl RemoteFilesystem {
             fetching.insert(chunk_key.clone());
         }
 
-        let self_clone = self.http_client.clone();
+        let client = self.http_client.clone();
         let url_base = self.server_url.clone();
         let cache = self.read_cache.clone();
         let fetching_set = self.fetching_chunks.clone();
-        
+        let chunk_size = Self::READ_CHUNK_SIZE;
+
         self.runtime_handle.spawn(async move {
-            let url_str = format!("files/{}?offset={}&size={}", path_clean, next_chunk_start, Self::READ_CHUNK_SIZE);
-            if let Ok(url) = url_base.join(&url_str) {
-                println!("[DEBUG] PREFETCH START -> {} | offset: {}", path_clean, next_chunk_start);
-                if let Ok(resp) = self_clone.get(url).send().await {
-                    if resp.status().is_success() {
+            if let Ok(url) = url_base.join(&format!("files/{}", path_clean)) {
+                let range_header = format!("bytes={}-{}", next_chunk_start, next_chunk_start + chunk_size as u64 - 1);
+                
+                println!("[DEBUG] PREFETCH START -> {} | Range: {}", path_clean, range_header);
+                
+                if let Ok(resp) = client.get(url).header("Range", range_header).send().await {
+                    if resp.status().is_success() || resp.status() == 206 {
                         if let Ok(bytes) = resp.bytes().await {
                             println!("[DEBUG] PREFETCH OK -> {} | offset: {}", path_clean, next_chunk_start);
                             cache.insert(chunk_key.clone(), Arc::new(bytes.to_vec())).await;
