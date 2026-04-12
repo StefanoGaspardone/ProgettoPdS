@@ -1,15 +1,15 @@
 use actix_web::{web, HttpRequest, HttpResponse, Result};
 use std::path::{Path, PathBuf, Component};
 use std::fs;
-use std::io::{Read, Seek, ErrorKind, SeekFrom};
+use std::io::{ErrorKind, SeekFrom};
 use serde::{Serialize, Deserialize};
 use actix_web::http::header::{HeaderName, HeaderValue};
+use actix_web::http::StatusCode;
 use futures_util::StreamExt;
 use tokio_util::io::ReaderStream;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use log::{info, warn};
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::fs::OpenOptions;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -219,12 +219,7 @@ pub async fn read_file(
             size
         );
 
-        let mut file = match fs::File::open(&full_path) {
-            Ok(f) => f,
-            Err(e) => return Ok(fs_error_json(&e, "Failed to open file")),
-        };
-
-        let file_size = match file.metadata() {
+        let file_size = match tokio::fs::metadata(&full_path).await {
             Ok(m) => m.len(),
             Err(e) => return Ok(fs_error_json(&e, "Failed to stat file")),
         };
@@ -235,20 +230,8 @@ pub async fn read_file(
                 .body(Vec::<u8>::new()));
         }
 
-        let to_read = std::cmp::min(size, file_size - offset) as usize;
-        let mut buf = vec![0u8; to_read];
-
-        if let Err(e) = file.seek(SeekFrom::Start(offset)) {
-            return Ok(fs_error_json(&e, "Failed to seek"));
-        }
-
-        if let Err(e) = file.read_exact(&mut buf) {
-            return Ok(fs_error_json(&e, "Failed to read requested chunk"));
-        }
-
-        return Ok(HttpResponse::Ok()
-            .content_type("application/octet-stream")
-            .body(buf));
+        let to_read = std::cmp::min(size, file_size - offset);
+        return stream_file_slice(&full_path, offset, Some(to_read), StatusCode::OK, None).await;
     }
 
     if let Some(range_header) = req.headers().get("Range") {
@@ -356,19 +339,25 @@ pub async fn patch_file(
         }
     }
 
-    let mut file = match OpenOptions::new().read(true).write(true).create(true).open(&full_path) {
+    let mut file = match tokio::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&full_path)
+        .await
+    {
         Ok(f) => f,
         Err(e) => return Ok(fs_error_json(&e, "Failed to open file")),
     };
 
-    let current_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let current_len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
     if end + 1 > current_len {
-        if let Err(e) = file.set_len(end + 1) { // end è inclusivo
+        if let Err(e) = file.set_len(end + 1).await { // end è inclusivo
             return Ok(fs_error_json(&e, "Failed to extend file"));
         }
     }
 
-    if let Err(e) = file.seek(SeekFrom::Start(start)) {
+    if let Err(e) = file.seek(SeekFrom::Start(start)).await {
         return Ok(fs_error_json(&e, "Failed to seek"));
     }
 
@@ -379,7 +368,7 @@ pub async fn patch_file(
             return Ok(HttpResponse::BadRequest().json("Payload larger than Content-Range"));
         }
         
-        if let Err(e) = std::io::Write::write_all(&mut file, &bytes) {
+        if let Err(e) = file.write_all(&bytes).await {
             return Ok(fs_error_json(&e, "Failed to write chunk"));
         }
         
@@ -388,6 +377,10 @@ pub async fn patch_file(
 
     if (total as u64) != expected_len {
         return Ok(HttpResponse::BadRequest().json("Payload size does not match Content-Range"));
+    }
+
+    if let Err(e) = file.flush().await {
+        return Ok(fs_error_json(&e, "Failed to flush file"));
     }
 
     Ok(HttpResponse::Ok().json(ApiResponse { success: true, message: None, bytes_written: Some(total) }))
@@ -580,8 +573,10 @@ async fn handle_range_request(
     start: u64,
     end: Option<u64>
 ) -> Result<HttpResponse> {
-    let mut file = fs::File::open(file_path)?;
-    let file_size = file.metadata()?.len();
+    let file_size = tokio::fs::metadata(file_path)
+        .await
+        .map_err(actix_web::error::ErrorInternalServerError)?
+        .len();
     
     let actual_end = end.unwrap_or(file_size - 1);
     let actual_end = actual_end.min(file_size - 1);
@@ -604,19 +599,47 @@ async fn handle_range_request(
         file_size
     );
     
-    let mut buffer = vec![0; (actual_end - start + 1) as usize];
-    file.seek(std::io::SeekFrom::Start(start))?;
-    file.read_exact(&mut buffer)?;
-    
-    let mut response = HttpResponse::PartialContent()
-        .content_type("application/octet-stream")
-        .body(buffer);
-    
-    response.headers_mut().insert(
-        HeaderName::from_static("content-range"),
-        HeaderValue::from_str(&format!("bytes {}-{}/{}", start, actual_end, file_size)).unwrap()
-    );
-    
+    let content_range = format!("bytes {}-{}/{}", start, actual_end, file_size);
+    stream_file_slice(
+        file_path,
+        start,
+        Some(actual_end - start + 1),
+        StatusCode::PARTIAL_CONTENT,
+        Some(content_range),
+    )
+    .await
+}
+
+async fn stream_file_slice(
+    file_path: &Path,
+    start: u64,
+    len: Option<u64>,
+    status: StatusCode,
+    content_range: Option<String>,
+) -> Result<HttpResponse> {
+    let mut file = tokio::fs::File::open(file_path)
+        .await
+        .map_err(actix_web::error::ErrorInternalServerError)?;
+
+    file.seek(SeekFrom::Start(start))
+        .await
+        .map_err(actix_web::error::ErrorInternalServerError)?;
+
+    let mut builder = HttpResponse::build(status);
+    builder.content_type("application/octet-stream");
+
+    if let Some(ref cr) = content_range {
+        builder.insert_header(("Content-Range", cr.clone()));
+    }
+
+    let response = if let Some(max_len) = len {
+        let stream = ReaderStream::new(file.take(max_len));
+        builder.streaming(stream)
+    } else {
+        let stream = ReaderStream::new(file);
+        builder.streaming(stream)
+    };
+
     Ok(response)
 }
 
