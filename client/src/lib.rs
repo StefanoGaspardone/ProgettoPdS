@@ -69,7 +69,7 @@ pub struct RemoteFilesystem {
 }
 
 impl RemoteFilesystem {
-    const READ_CHUNK_SIZE: usize = 8 * 1024 * 1024; // 8 MiB chunk for maximum speed
+    const READ_CHUNK_SIZE: usize = 1024 * 1024; // 8 MiB chunk for maximum speed
 
     fn endpoint_for_path(prefix: &str, path_clean: &str) -> String {
         if path_clean.is_empty() {
@@ -80,6 +80,8 @@ impl RemoteFilesystem {
     }
 
     async fn fetch_range(&self, path_clean: &str, offset: u64, size: usize) -> Result<Vec<u8>, i32> {
+        println!("[DEBUG] fetch_range() requesting -> {} | offset: {} | size: {}", path_clean, offset, size);
+
         let url_str = format!("files/{}?offset={}&size={}", path_clean, offset, size);
         let url = self.server_url.join(&url_str).map_err(|_| EIO)?;
 
@@ -89,10 +91,12 @@ impl RemoteFilesystem {
             .map_err(map_net_error)?;
 
         if !resp.status().is_success() {
+            println!("[ERROR] fetch_range() failed with status {}", resp.status());
             return Err(EIO);
         }
 
         let bytes = resp.bytes().await.map_err(map_net_error)?;
+        println!("[DEBUG] fetch_range() downloaded bytes: {}", bytes.len());
         Ok(bytes.to_vec())
     }
 
@@ -428,10 +432,6 @@ impl RemoteFilesystem {
 
         let chunk_key = format!("{}:{}", path_clean, next_chunk_start);
         
-        if self.read_cache.contains_key(&chunk_key) {
-            return;
-        }
-
         let self_clone = self.http_client.clone();
         let url_base = self.server_url.clone();
         let cache = self.read_cache.clone();
@@ -443,6 +443,7 @@ impl RemoteFilesystem {
             }
 
             let _ = cache.try_get_with(chunk_key, async move {
+                println!("[DEBUG] PREFETCH START -> {} | offset: {}", path_clean, next_chunk_start);
                 let url_str = format!("files/{}?offset={}&size={}", path_clean, next_chunk_start, Self::READ_CHUNK_SIZE);
                 let url = url_base.join(&url_str).map_err(|_| EIO)?;
                 
@@ -450,8 +451,10 @@ impl RemoteFilesystem {
                 
                 if resp.status().is_success() {
                     let bytes = resp.bytes().await.map_err(|_| EIO)?;
+                    println!("[DEBUG] PREFETCH OK -> {} | offset: {} | {} bytes", path_clean, next_chunk_start, bytes.len());
                     Ok::<Arc<Vec<u8>>, i32>(Arc::new(bytes.to_vec()))
                 } else {
+                    println!("[DEBUG] PREFETCH FAIL -> status {}", resp.status());
                     Err::<Arc<Vec<u8>>, i32>(EIO)
                 }
             }).await;

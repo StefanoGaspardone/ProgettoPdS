@@ -139,8 +139,6 @@ async fn get_stat(path: Option<Path<String>>) -> impl IntoResponse {
     let file_path = path.map(|Path(p)| p).unwrap_or_default();
     let relative_path = file_path.trim_start_matches('/');
 
-    println!("\n[GET /stat] /{}", relative_path);
-
     let full_path = storage_root().join(relative_path);
 
     match fs::metadata(&full_path).await {
