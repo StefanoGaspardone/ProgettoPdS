@@ -108,7 +108,7 @@ async fn read_file(path: Option<Path<String>>, Query(params): Query<ReadParams>)
 
     let mut file = match fs::File::open(&full_path).await {
         Ok(f) => f,
-        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::NOT_FOUND.into_response(), 
     };
 
     let offset = params.offset.unwrap_or(0);

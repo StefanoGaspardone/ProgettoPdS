@@ -109,23 +109,23 @@ impl RemoteFilesystem {
                 return Ok(cached);
             }
             
-            let is_fetching = {
-                let fetching = self.fetching_chunks.lock().await;
-                fetching.contains(&chunk_key)
+            let should_fetch = {
+                let mut fetching = self.fetching_chunks.lock().await;
+                if fetching.contains(&chunk_key) {
+                    false
+                } else {
+                    fetching.insert(chunk_key.clone());
+                    true
+                }
             };
             
-            if is_fetching {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            } else {
+            if should_fetch {
                 break;
+            } else {
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
         }
         
-        {
-            let mut fetching = self.fetching_chunks.lock().await;
-            fetching.insert(chunk_key.clone());
-        }
-
         let result = match self.fetch_range(path_clean, chunk_start, Self::READ_CHUNK_SIZE).await {
             Ok(data) => {
                 let arc_data = Arc::new(data);
@@ -304,17 +304,12 @@ impl RemoteFilesystem {
     }
 
     pub async fn read_file(&self, path: &str, offset: u64, size: u32) -> Result<Vec<u8>, i32> {
-        // 1. Controllo se siamo online
         if !self.is_online.load(Ordering::SeqCst) { 
             return Err(ENOTCONN); 
         }
 
         let path_clean = path.trim_start_matches('/');
-        
-        // Se la richiesta è 0 byte, usciamo subito
-        if size == 0 {
-            return Ok(Vec::new());
-        }
+        if size == 0 { return Ok(Vec::new()); }
 
         let requested = size as usize;
         let mut out = Vec::with_capacity(requested);
@@ -322,50 +317,31 @@ impl RemoteFilesystem {
         let mut current_offset = offset;
 
         while remaining > 0 {
-            // Calcoliamo l'inizio del chunk (allineato a 1MB)
             let chunk_start = (current_offset / Self::READ_CHUNK_SIZE as u64) * Self::READ_CHUNK_SIZE as u64;
             let offset_in_chunk = (current_offset - chunk_start) as usize;
 
-            // --- PIPELINING ---
-            // Lanciamo il prefetch del PROSSIMO chunk in background.
-            // Essendo una operazione 'spawned', non blocca questo loop.
+            // 1. Prefetch del prossimo chunk
             let next_chunk_offset = chunk_start + Self::READ_CHUNK_SIZE as u64;
             self.prefetch_next_chunk(path_clean.to_string(), next_chunk_offset).await;
 
-            // --- FETCH CORRENTE ---
-            // Ora recuperiamo il chunk che ci serve. Se il prefetch del ciclo precedente
-            // ha funzionato, lo troveremo già nella 'read_cache'.
-            let chunk = match self.fetch_chunk(path_clean, chunk_start).await {
-                Ok(cached) => cached,
-                Err(_) => {
-                    // Se il sistema di chunking fallisce (es. errore di rete specifico),
-                    // proviamo un fallback diretto sul range richiesto per non bloccare l'utente.
-                    println!("[DEBUG] Chunk fetch failed, falling back to direct range request");
-                    self.read_cache.invalidate_all();
-                    return self.fetch_range(path_clean, offset, requested).await;
-                }
-            };
+            // 2. Fetch del chunk attuale (RIMOSSO IL FALLBACK)
+            // Se fallisce qui, restituiamo l'errore a FUSE che riproverà in automatico
+            let chunk = self.fetch_chunk(path_clean, chunk_start).await.map_err(|e| {
+                println!("[ERROR] Chunk fetch fallito all'offset {}: {}", chunk_start, e);
+                e
+            })?;
 
-            // Controllo di sicurezza sui limiti del chunk ricevuto
-            if offset_in_chunk >= chunk.len() {
-                break;
-            }
+            if offset_in_chunk >= chunk.len() { break; }
 
-            // Calcoliamo quanto possiamo prendere da questo chunk
             let avail = chunk.len() - offset_in_chunk;
             let to_take = min(remaining, avail);
 
-            // Copiamo i dati nel buffer di uscita
             out.extend_from_slice(&chunk[offset_in_chunk..offset_in_chunk + to_take]);
 
-            // Aggiorniamo i puntatori
             remaining -= to_take;
             current_offset += to_take as u64;
 
-            // Se il chunk ricevuto è più piccolo dello standard, significa che il file è finito
-            if chunk.len() < Self::READ_CHUNK_SIZE {
-                break;
-            }
+            if chunk.len() < Self::READ_CHUNK_SIZE { break; }
         }
 
         Ok(out)

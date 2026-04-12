@@ -245,6 +245,7 @@ pub fn run_fuser_client(fs: Arc<RemoteFilesystem>, mountpoint: String) {
     options.mount_options = vec![
         MountOption::RW,
         MountOption::FSName("remote-file-system".to_string()),
+        MountOption::CUSTOM("auto_cache".to_string()),
     ];
 
     mount2(FuseAdapter { fs }, &mountpoint, &options).expect("Mount failed");
