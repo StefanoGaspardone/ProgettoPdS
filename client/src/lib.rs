@@ -59,6 +59,7 @@ pub struct RemoteFilesystem {
     pub runtime_handle: Handle,
     pub metadata_cache: Cache<String, (u64, FileInfo)>,
     pub read_cache: Cache<String, Arc<Vec<u8>>>,
+    pub fetching_chunks: Arc<Mutex<std::collections::HashSet<String>>>,
     pub path_to_inode: RwLock<HashMap<String, u64>>,
     pub inode_to_path: RwLock<HashMap<u64, String>>,
     pub parent_map: RwLock<HashMap<u64, u64>>,
@@ -69,7 +70,7 @@ pub struct RemoteFilesystem {
 }
 
 impl RemoteFilesystem {
-    const READ_CHUNK_SIZE: usize = 1024 * 1024; // 8 MiB chunk for maximum speed
+    const READ_CHUNK_SIZE: usize = 8 * 1024 * 1024; // 8 MiB chunk for maximum speed
 
     fn endpoint_for_path(prefix: &str, path_clean: &str) -> String {
         if path_clean.is_empty() {
@@ -102,12 +103,44 @@ impl RemoteFilesystem {
 
     async fn fetch_chunk(&self, path_clean: &str, chunk_start: u64) -> Result<Arc<Vec<u8>>, i32> {
         let chunk_key = format!("{}:{}", path_clean, chunk_start);
-        let path_clone = path_clean.to_string();
+        
+        loop {
+            if let Some(cached) = self.read_cache.get(&chunk_key).await {
+                return Ok(cached);
+            }
+            
+            let is_fetching = {
+                let fetching = self.fetching_chunks.lock().await;
+                fetching.contains(&chunk_key)
+            };
+            
+            if is_fetching {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            } else {
+                break;
+            }
+        }
+        
+        {
+            let mut fetching = self.fetching_chunks.lock().await;
+            fetching.insert(chunk_key.clone());
+        }
 
-        self.read_cache.try_get_with(chunk_key, async move {
-            let data = self.fetch_range(&path_clone, chunk_start, Self::READ_CHUNK_SIZE).await?;
-            Ok::<Arc<Vec<u8>>, i32>(Arc::new(data))
-        }).await.map_err(|e| *e)
+        let result = match self.fetch_range(path_clean, chunk_start, Self::READ_CHUNK_SIZE).await {
+            Ok(data) => {
+                let arc_data = Arc::new(data);
+                self.read_cache.insert(chunk_key.clone(), arc_data.clone()).await;
+                Ok(arc_data)
+            },
+            Err(e) => Err(e),
+        };
+
+        {
+            let mut fetching = self.fetching_chunks.lock().await;
+            fetching.remove(&chunk_key);
+        }
+
+        result
     }
 
     pub fn new(server_url: &str) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
@@ -142,6 +175,7 @@ impl RemoteFilesystem {
             runtime_handle,
             metadata_cache,
             read_cache,
+            fetching_chunks: Arc::new(Mutex::new(std::collections::HashSet::new())),
             path_to_inode: RwLock::new(HashMap::from([(String::new(), 1)])),
             inode_to_path: RwLock::new(HashMap::from([(1, String::new())])),
             parent_map: RwLock::new(HashMap::from([(1, 1)])),
@@ -432,32 +466,41 @@ impl RemoteFilesystem {
 
         let chunk_key = format!("{}:{}", path_clean, next_chunk_start);
         
+        if self.read_cache.contains_key(&chunk_key) {
+            return;
+        }
+
+        {
+            let mut fetching = self.fetching_chunks.lock().await;
+            if fetching.contains(&chunk_key) {
+                return;
+            }
+            fetching.insert(chunk_key.clone());
+        }
+
         let self_clone = self.http_client.clone();
         let url_base = self.server_url.clone();
         let cache = self.read_cache.clone();
-        let shutdown = self.shutdown.clone();
+        let fetching_set = self.fetching_chunks.clone();
         
         self.runtime_handle.spawn(async move {
-            if shutdown.load(Ordering::SeqCst) {
-                return;
-            }
-
-            let _ = cache.try_get_with(chunk_key, async move {
+            let url_str = format!("files/{}?offset={}&size={}", path_clean, next_chunk_start, Self::READ_CHUNK_SIZE);
+            if let Ok(url) = url_base.join(&url_str) {
                 println!("[DEBUG] PREFETCH START -> {} | offset: {}", path_clean, next_chunk_start);
-                let url_str = format!("files/{}?offset={}&size={}", path_clean, next_chunk_start, Self::READ_CHUNK_SIZE);
-                let url = url_base.join(&url_str).map_err(|_| EIO)?;
-                
-                let resp = self_clone.get(url).send().await.map_err(|_| EIO)?;
-                
-                if resp.status().is_success() {
-                    let bytes = resp.bytes().await.map_err(|_| EIO)?;
-                    println!("[DEBUG] PREFETCH OK -> {} | offset: {} | {} bytes", path_clean, next_chunk_start, bytes.len());
-                    Ok::<Arc<Vec<u8>>, i32>(Arc::new(bytes.to_vec()))
-                } else {
-                    println!("[DEBUG] PREFETCH FAIL -> status {}", resp.status());
-                    Err::<Arc<Vec<u8>>, i32>(EIO)
+                if let Ok(resp) = self_clone.get(url).send().await {
+                    if resp.status().is_success() {
+                        if let Ok(bytes) = resp.bytes().await {
+                            println!("[DEBUG] PREFETCH OK -> {} | offset: {}", path_clean, next_chunk_start);
+                            cache.insert(chunk_key.clone(), Arc::new(bytes.to_vec())).await;
+                        }
+                    } else {
+                        println!("[DEBUG] PREFETCH FAIL -> status {}", resp.status());
+                    }
                 }
-            }).await;
+            }
+            
+            let mut fetching = fetching_set.lock().await;
+            fetching.remove(&chunk_key);
         });
     }
 }
