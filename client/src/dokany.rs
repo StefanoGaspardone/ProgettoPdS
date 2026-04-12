@@ -1,23 +1,26 @@
-use std::sync::Arc;
-use std::time::SystemTime;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use anyhow::Result;
+use crate::apis::{ApiClient, FileEntry};
 use dokan::{
-    FileSystemHandler, OperationInfo, OperationResult, IO_SECURITY_CONTEXT,
-    FileInfo, FindData, VolumeInfo, DiskSpaceInfo, CreateFileInfo,
-    MountOptions, FileSystemMounter, FillDataResult
+    CreateFileInfo, DiskSpaceInfo, FileInfo, FileSystemHandler, FileSystemMounter, FillDataResult,
+    FindData, MountOptions, OperationInfo, OperationResult, VolumeInfo, IO_SECURITY_CONTEXT,
 };
+use libc::{EIO, ENOENT, ENOTCONN};
 use widestring::{U16CStr, U16CString};
-use libc::{ENOENT, EIO, ENOTCONN};
-use crate::RemoteFilesystem;
 
-pub type NTSTATUS = i32;
+use crate::cache::{CacheManager, METADATA_CACHE_TTL};
 
-pub const STATUS_SUCCESS: NTSTATUS = 0;
-pub const STATUS_OBJECT_NAME_NOT_FOUND: NTSTATUS = 0xC0000034u32 as i32;
-pub const STATUS_IO_DEVICE_ERROR: NTSTATUS = 0xC0000185u32 as i32;
-pub const STATUS_DEVICE_NOT_CONNECTED: NTSTATUS = 0xC000009Du32 as i32;
-pub const STATUS_ACCESS_DENIED: NTSTATUS = 0xC0000022u32 as i32;
-pub const STATUS_NOT_IMPLEMENTED: NTSTATUS = 0xC0000002u32 as i32;
-pub const STATUS_NOT_A_DIRECTORY: NTSTATUS = 0xC0000103u32 as i32;
+pub type NtStatus = i32;
+
+pub const STATUS_SUCCESS: NtStatus = 0;
+pub const STATUS_OBJECT_NAME_NOT_FOUND: NtStatus = 0xC0000034u32 as i32;
+pub const STATUS_IO_DEVICE_ERROR: NtStatus = 0xC0000185u32 as i32;
+pub const STATUS_DEVICE_NOT_CONNECTED: NtStatus = 0xC000009Du32 as i32;
+pub const STATUS_ACCESS_DENIED: NtStatus = 0xC0000022u32 as i32;
+pub const STATUS_NOT_A_DIRECTORY: NtStatus = 0xC0000103u32 as i32;
+pub const STATUS_FILE_IS_A_DIRECTORY: NtStatus = 0xC00000BAu32 as i32;
 
 const FILE_NON_DIRECTORY_FILE: u32 = 0x00000040;
 const FILE_DIRECTORY_FILE: u32 = 0x00000001;
@@ -28,7 +31,7 @@ const FILE_OVERWRITE_IF: u32 = 5;
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 
-fn posix_to_ntstatus(err: i32) -> NTSTATUS {
+fn posix_to_ntstatus(err: i32) -> NtStatus {
     match err {
         0 => STATUS_SUCCESS,
         ENOENT => STATUS_OBJECT_NAME_NOT_FOUND,
@@ -42,34 +45,159 @@ fn normalize_remote_path(path: &str) -> String {
     path.replace('\\', "/").trim_start_matches('/').to_string()
 }
 
-impl<'c, 'h> FileSystemHandler<'c, 'h> for RemoteFilesystem where 'h: 'c {
+fn split_parent_and_name(path: &str) -> (String, String) {
+    let normalized = path.trim_matches('/');
+    if normalized.is_empty() {
+        return ("/".to_string(), "".to_string());
+    }
+
+    if let Some((parent, name)) = normalized.rsplit_once('/') {
+        let parent_norm = if parent.is_empty() {
+            "/".to_string()
+        } else {
+            format!("/{parent}")
+        };
+        (parent_norm, name.to_string())
+    } else {
+        ("/".to_string(), normalized.to_string())
+    }
+}
+
+struct DokanyFs {
+    api_client: Arc<ApiClient>,
+    ino_counter: Mutex<u64>,
+    cache: Mutex<CacheManager>,
+    last_cleanup: Mutex<Instant>,
+}
+
+impl DokanyFs {
+    fn next_ino(&self) -> u64 {
+        let mut counter = self.ino_counter.lock().unwrap();
+        let ino = *counter;
+        *counter += 1;
+        ino
+    }
+
+    fn lookup_entry(&self, remote_path: &str) -> Result<(u64, FileEntry), i32> {
+        let normalized = remote_path.trim_start_matches('/');
+        if normalized.is_empty() {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs_f64();
+            return Ok((1, FileEntry {
+                name: "/".to_string(),
+                is_dir: true,
+                size: 0,
+                mtime: now,
+                ctime: now,
+                mode: 0o755,
+            }));
+        }
+
+        let (parent, name) = split_parent_and_name(normalized);
+        let entries = if let Ok(mut cache) = self.cache.lock() {
+            cache
+                .list_directory_cached(&parent, &self.api_client)
+                .map_err(|e| e.errno)?
+        } else {
+            self.api_client.list_directory(&parent).map_err(|e| e.errno)?
+        };
+        if let Some(entry) = entries.into_iter().find(|e| e.name == name) {
+            Ok((self.next_ino(), entry))
+        } else {
+            Err(ENOENT)
+        }
+    }
+
+    fn lookup_entry_fresh(&self, remote_path: &str) -> Result<(u64, FileEntry), i32> {
+        let normalized = remote_path.trim_start_matches('/');
+        if normalized.is_empty() {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs_f64();
+            return Ok((1, FileEntry {
+                name: "/".to_string(),
+                is_dir: true,
+                size: 0,
+                mtime: now,
+                ctime: now,
+                mode: 0o755,
+            }));
+        }
+
+        let (parent, name) = split_parent_and_name(normalized);
+        let entries = self.api_client.list_directory(&parent).map_err(|e| e.errno)?;
+
+        if let Some(entry) = entries.into_iter().find(|e| e.name == name) {
+            Ok((self.next_ino(), entry))
+        } else {
+            Err(ENOENT)
+        }
+    }
+
+    fn invalidate_path(&self, path: &str) {
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.invalidate_all_for_path(path);
+        }
+    }
+
+    fn maybe_cleanup_cache(&self) {
+        if let Ok(mut last_cleanup) = self.last_cleanup.lock()
+            && last_cleanup.elapsed() >= METADATA_CACHE_TTL
+        {
+            if let Ok(mut cache) = self.cache.lock() {
+                cache.cleanup_expired();
+            }
+            *last_cleanup = Instant::now();
+        }
+    }
+}
+
+impl<'c, 'h> FileSystemHandler<'c, 'h> for DokanyFs
+where
+    'h: 'c,
+{
     type Context = ();
 
-    fn create_file(&'h self, file_name: &U16CStr, _security_context: &IO_SECURITY_CONTEXT, _desired_access: u32, _file_attributes: u32, _share_access: u32, create_disposition: u32, create_options: u32, _info: &mut OperationInfo<'c, 'h, Self>) -> OperationResult<CreateFileInfo<Self::Context>> {
+    fn create_file(
+        &'h self,
+        file_name: &U16CStr,
+        _security_context: &IO_SECURITY_CONTEXT,
+        _desired_access: u32,
+        _file_attributes: u32,
+        _share_access: u32,
+        create_disposition: u32,
+        create_options: u32,
+        _info: &mut OperationInfo<'c, 'h, Self>,
+    ) -> OperationResult<CreateFileInfo<Self::Context>> {
+        let _guard = self.api_client.enter_runtime();
+
+        self.maybe_cleanup_cache();
         let path_raw = file_name.to_string_lossy();
         let path_str = normalize_remote_path(&path_raw);
         let is_dir_request = (create_options & FILE_DIRECTORY_FILE) != 0;
         let non_dir_request = (create_options & FILE_NON_DIRECTORY_FILE) != 0;
 
-        match self.runtime_handle.block_on(self.get_stat(&path_str)) {
-            Ok((_ino, info)) => {
-                let is_dir = info.file_type == "dir";
+        // Prepariamo il percorso del padre per l'invalidazione successiva
+        let (parent_path, _) = split_parent_and_name(&path_str);
 
-                if is_dir_request && !is_dir {
+        match self.lookup_entry(&path_str) {
+            Ok((_ino, info)) => {
+                if is_dir_request && !info.is_dir {
                     return Err(STATUS_NOT_A_DIRECTORY);
                 }
-
-                if non_dir_request && is_dir {
+                if non_dir_request && info.is_dir {
                     return Err(STATUS_ACCESS_DENIED);
                 }
-
                 if create_disposition == FILE_CREATE {
                     return Err(STATUS_ACCESS_DENIED);
                 }
 
                 Ok(CreateFileInfo {
                     context: (),
-                    is_dir,
+                    is_dir: info.is_dir,
                     new_file_created: false,
                 })
             }
@@ -78,15 +206,18 @@ impl<'c, 'h> FileSystemHandler<'c, 'h> for RemoteFilesystem where 'h: 'c {
                     create_disposition,
                     FILE_CREATE | FILE_OPEN_IF | FILE_OVERWRITE_IF | FILE_SUPERSEDE
                 );
-
                 if !can_create {
                     return Err(STATUS_OBJECT_NAME_NOT_FOUND);
                 }
 
                 if is_dir_request {
-                    self.runtime_handle
-                        .block_on(self.create_dir(&path_str))
-                        .map_err(posix_to_ntstatus)?;
+                    self.api_client
+                        .create_directory(&path_str)
+                        .map_err(|e| posix_to_ntstatus(e.errno))?;
+                    
+                    // IMPORTANTE: Invalida sia il nuovo percorso che il padre
+                    self.invalidate_path(&path_str);
+                    self.invalidate_path(&parent_path);
 
                     return Ok(CreateFileInfo {
                         context: (),
@@ -95,135 +226,269 @@ impl<'c, 'h> FileSystemHandler<'c, 'h> for RemoteFilesystem where 'h: 'c {
                     });
                 }
 
-                if non_dir_request || !is_dir_request {
-                    self.runtime_handle
-                        .block_on(self.write_file(&path_str, 0, Vec::new()))
-                        .map_err(posix_to_ntstatus)?;
+                self.api_client
+                    .write_file(&path_str, &[])
+                    .map_err(|e| posix_to_ntstatus(e.errno))?;
 
-                    return Ok(CreateFileInfo {
-                        context: (),
-                        is_dir: false,
-                        new_file_created: true,
-                    });
-                }
+                self.invalidate_path(&path_str);
+                self.invalidate_path(&parent_path);
 
-                Err(STATUS_ACCESS_DENIED)
-            }
-            Err(e) => Err(posix_to_ntstatus(e)),
-        }
-    }
-
-    fn get_file_information(&'h self, file_name: &U16CStr, _info: &OperationInfo<'c, 'h, Self>, _context: &'c Self::Context,) -> OperationResult<FileInfo> {
-        let path_raw = file_name.to_string_lossy();
-        let path_str = normalize_remote_path(&path_raw);
-        
-        match self.runtime_handle.block_on(self.get_stat(&path_str)) {
-            Ok((ino, info)) => {
-                let is_dir = info.file_type == "dir";
-                
-                Ok(FileInfo {
-                    attributes: if is_dir { FILE_ATTRIBUTE_DIRECTORY } else { FILE_ATTRIBUTE_NORMAL },
-                    creation_time: SystemTime::UNIX_EPOCH,
-                    last_access_time: SystemTime::UNIX_EPOCH,
-                    last_write_time: SystemTime::UNIX_EPOCH,
-                    file_size: info.size,
-                    number_of_links: 1,
-                    file_index: ino as u64,
+                Ok(CreateFileInfo {
+                    context: (),
+                    is_dir: false,
+                    new_file_created: true,
                 })
             }
             Err(e) => Err(posix_to_ntstatus(e)),
         }
     }
 
-    fn find_files(&'h self, file_name: &U16CStr, mut fill_find_data: impl FnMut(&FindData) -> FillDataResult, _info: &OperationInfo<'c, 'h, Self>, _context: &'c Self::Context,) -> OperationResult<()> {
+    fn get_file_information(
+        &'h self,
+        file_name: &U16CStr,
+        _info: &OperationInfo<'c, 'h, Self>,
+        _context: &'c Self::Context,
+    ) -> OperationResult<FileInfo> {
+        let _guard = self.api_client.enter_runtime();
+
+        self.maybe_cleanup_cache();
         let path_raw = file_name.to_string_lossy();
         let path_str = normalize_remote_path(&path_raw);
-        
-        match self.runtime_handle.block_on(self.list_dir(&path_str)) {
-            Ok(entries) => {
-                for (_ino, info) in entries {
-                    let is_dir = info.file_type == "dir";
-                    let entry = FindData {
-                        file_name: U16CString::from_str(&info.name).unwrap(),
-                        attributes: if is_dir { FILE_ATTRIBUTE_DIRECTORY } else { FILE_ATTRIBUTE_NORMAL },
-                        creation_time: SystemTime::UNIX_EPOCH,
-                        last_access_time: SystemTime::UNIX_EPOCH,
-                        last_write_time: SystemTime::UNIX_EPOCH,
-                        file_size: info.size,
-                    };
 
-                    if fill_find_data(&entry).is_err() { break; }
+        match self.lookup_entry(&path_str) {
+            Ok((ino, info)) => Ok(FileInfo {
+                attributes: if info.is_dir {
+                    FILE_ATTRIBUTE_DIRECTORY
+                } else {
+                    FILE_ATTRIBUTE_NORMAL
+                },
+                creation_time: UNIX_EPOCH + Duration::from_secs_f64(info.ctime),
+                last_access_time: UNIX_EPOCH + Duration::from_secs_f64(info.mtime),
+                last_write_time: UNIX_EPOCH + Duration::from_secs_f64(info.mtime),
+                file_size: info.size,
+                number_of_links: 1,
+                file_index: ino,
+            }),
+            Err(e) => Err(posix_to_ntstatus(e)),
+        }
+    }
+
+    fn find_files(
+        &'h self,
+        file_name: &U16CStr,
+        mut fill_find_data: impl FnMut(&FindData) -> FillDataResult,
+        _info: &OperationInfo<'c, 'h, Self>,
+        _context: &'c Self::Context,
+    ) -> OperationResult<()> {
+        let _guard = self.api_client.enter_runtime();
+
+        self.maybe_cleanup_cache();
+        let path_raw = file_name.to_string_lossy();
+        let path_str = normalize_remote_path(&path_raw);
+        let list_path = if path_str.is_empty() {
+            "/".to_string()
+        } else {
+            format!("/{path_str}")
+        };
+
+        let entries = self
+            .cache
+            .lock()
+            .ok()
+            .and_then(|mut cache| cache.list_directory_cached(&list_path, &self.api_client).ok())
+            .or_else(|| self.api_client.list_directory(&list_path).ok())
+            .ok_or(STATUS_IO_DEVICE_ERROR)?;
+
+        for info in entries {
+            let entry = FindData {
+                file_name: U16CString::from_str(&info.name).map_err(|_| STATUS_IO_DEVICE_ERROR)?,
+                attributes: if info.is_dir {
+                    FILE_ATTRIBUTE_DIRECTORY
+                } else {
+                    FILE_ATTRIBUTE_NORMAL
+                },
+                creation_time: UNIX_EPOCH + Duration::from_secs_f64(info.ctime),
+                last_access_time: UNIX_EPOCH + Duration::from_secs_f64(info.mtime),
+                last_write_time: UNIX_EPOCH + Duration::from_secs_f64(info.mtime),
+                file_size: info.size,
+            };
+
+            if fill_find_data(&entry).is_err() {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn read_file(
+        &'h self,
+        file_name: &U16CStr,
+        offset: i64,
+        buffer: &mut [u8],
+        _info: &OperationInfo<'c, 'h, Self>,
+        _context: &'c Self::Context,
+    ) -> OperationResult<u32> {
+        let _guard = self.api_client.enter_runtime();
+
+        self.maybe_cleanup_cache();
+        let path_raw = file_name.to_string_lossy();
+        let path_str = normalize_remote_path(&path_raw);
+
+        let data = if let Ok(mut cache) = self.cache.lock() {
+            cache
+                .read_with_cache(&path_str, offset.max(0) as u64, buffer.len() as u32, &self.api_client)
+                .map_err(|e| posix_to_ntstatus(e.errno))?
+        } else {
+            self.api_client
+                .read_file_chunk(&path_str, offset.max(0) as u64, buffer.len() as u32)
+                .map_err(|e| posix_to_ntstatus(e.errno))?
+        };
+
+        let len = data.len().min(buffer.len());
+        buffer[..len].copy_from_slice(&data[..len]);
+        Ok(len as u32)
+    }
+
+    fn write_file(
+        &'h self,
+        file_name: &U16CStr,
+        offset: i64,
+        buffer: &[u8],
+        _info: &OperationInfo<'c, 'h, Self>,
+        _context: &'c Self::Context,
+    ) -> OperationResult<u32> {
+        let _guard = self.api_client.enter_runtime();
+
+        self.maybe_cleanup_cache();
+        let path_raw = file_name.to_string_lossy();
+        let path_str = normalize_remote_path(&path_raw);
+
+        self.api_client
+            .write_file_chunk(&path_str, offset.max(0) as u64, buffer)
+            .map_err(|e| posix_to_ntstatus(e.errno))?;
+
+        let (parent_path, _) = split_parent_and_name(&path_str);
+
+        self.invalidate_path(&path_str);
+        self.invalidate_path(&parent_path);
+
+        Ok(buffer.len() as u32)
+    }
+
+    fn delete_file(
+        &'h self,
+        file_name: &U16CStr,
+        info: &OperationInfo<'c, 'h, Self>,
+        _context: &'c Self::Context,
+    ) -> OperationResult<()> {
+        let _guard = self.api_client.enter_runtime();
+        self.maybe_cleanup_cache();
+
+        // Kernel requested a file delete callback: if target is seen as directory, reject.
+        if info.is_dir() {
+            return Err(STATUS_FILE_IS_A_DIRECTORY);
+        }
+
+        let path_raw = file_name.to_string_lossy();
+        let path_str = normalize_remote_path(&path_raw);
+
+        // 1. Controllo preliminare
+        match self.lookup_entry_fresh(&path_str) {
+            Ok((_, info)) => {
+                if info.is_dir {
+                    // Errore: stai cercando di eliminare una cartella come se fosse un file
+                    return Err(STATUS_ACCESS_DENIED); 
                 }
-                Ok(())
             }
-            Err(e) => Err(posix_to_ntstatus(e)),
+            Err(e) => return Err(posix_to_ntstatus(e)),
         }
+
+        // 2. Procedi con l'eliminazione
+        self.api_client
+            .delete(&path_str)
+            .map_err(|e| posix_to_ntstatus(e.errno))?;
+
+        // 3. Invalida il percorso e il padre per aggiornare la UI
+        let (parent_path, _) = split_parent_and_name(&path_str);
+        self.invalidate_path(&path_str);
+        self.invalidate_path(&parent_path);
+        
+        Ok(())
     }
 
-    fn read_file(&'h self, file_name: &U16CStr, offset: i64, buffer: &mut [u8], _info: &OperationInfo<'c, 'h, Self>, _context: &'c Self::Context,) -> OperationResult<u32> {
+    fn delete_directory(
+        &'h self,
+        file_name: &U16CStr,
+        info: &OperationInfo<'c, 'h, Self>,
+        _context: &'c Self::Context,
+    ) -> OperationResult<()> {
+        let _guard = self.api_client.enter_runtime();
+        self.maybe_cleanup_cache();
+
+        // Kernel requested a directory delete callback: if target is not directory, reject.
+        if !info.is_dir() {
+            return Err(STATUS_NOT_A_DIRECTORY);
+        }
+
         let path_raw = file_name.to_string_lossy();
         let path_str = normalize_remote_path(&path_raw);
-        
-        match self.runtime_handle.block_on(self.read_file(&path_str, offset as u64, buffer.len() as u32)) {
-            Ok(data) => {
-                let len = data.len();
-                buffer[..len].copy_from_slice(&data);
-                
-                Ok(len as u32)
+
+        // 1. Controllo preliminare
+        match self.lookup_entry_fresh(&path_str) {
+            Ok((_, info)) => {
+                if !info.is_dir {
+                    // Errore: stai usando rmdir su un file normale
+                    return Err(STATUS_NOT_A_DIRECTORY);
+                }
             }
-            Err(e) => Err(posix_to_ntstatus(e)),
+            Err(e) => return Err(posix_to_ntstatus(e)),
         }
+
+        // 2. Procedi con l'eliminazione
+        self.api_client
+            .delete(&path_str)
+            .map_err(|e| posix_to_ntstatus(e.errno))?;
+
+        // 3. Invalida il percorso e il padre
+        let (parent_path, _) = split_parent_and_name(&path_str);
+        self.invalidate_path(&path_str);
+        self.invalidate_path(&parent_path);
+
+        Ok(())
     }
 
-    fn write_file(&'h self, file_name: &U16CStr, offset: i64, buffer: &[u8], _info: &OperationInfo<'c, 'h, Self>, _context: &'c Self::Context,) -> OperationResult<u32> {
-        let path_raw = file_name.to_string_lossy();
-        let path_str = normalize_remote_path(&path_raw);
-        
-        match self.runtime_handle.block_on(self.write_file(&path_str, offset as u64, buffer.to_vec())) {
-            Ok(_) => Ok(buffer.len() as u32),
-            Err(e) => Err(posix_to_ntstatus(e)),
-        }
-    }
+    fn move_file(
+        &'h self,
+        file_name: &U16CStr,
+        new_file_name: &U16CStr,
+        _replace_if_existing: bool,
+        _info: &OperationInfo<'c, 'h, Self>,
+        _context: &'c Self::Context,
+    ) -> OperationResult<()> {
+        let _guard = self.api_client.enter_runtime();
 
-    fn delete_file(&'h self, file_name: &U16CStr, _info: &OperationInfo<'c, 'h, Self>, _context: &'c Self::Context) -> OperationResult<()> {
-        let path_raw = file_name.to_string_lossy();
-        let path_str = normalize_remote_path(&path_raw);
-        
-        match self.runtime_handle.block_on(self.delete_path(&path_str)) {
-            Ok(_) => Ok(()),
-            Err(e) => Err(posix_to_ntstatus(e)),
-        }
-    }
-
-    fn delete_directory(&'h self, file_name: &U16CStr, _info: &OperationInfo<'c, 'h, Self>, _context: &'c Self::Context,) -> OperationResult<()> {
-        let path_raw = file_name.to_string_lossy();
-        let path_str = normalize_remote_path(&path_raw);
-        
-        match self.runtime_handle.block_on(self.delete_path(&path_str)) {
-            Ok(_) => Ok(()),
-            Err(e) => Err(posix_to_ntstatus(e)),
-        }
-    }
-
-    fn move_file(&'h self, file_name: &U16CStr, new_file_name: &U16CStr, _replace_if_existing: bool, _info: &OperationInfo<'c, 'h, Self>, _context: &'c Self::Context) -> OperationResult<()> {
+        self.maybe_cleanup_cache();
         let old_raw = file_name.to_string_lossy();
         let new_raw = new_file_name.to_string_lossy();
         let old_str = normalize_remote_path(&old_raw);
         let new_str = normalize_remote_path(&new_raw);
-        
-        match self.runtime_handle.block_on(self.rename(&old_str, &new_str)) {
-            Ok(_) => Ok(()),
-            Err(e) => Err(posix_to_ntstatus(e)),
-        }
+
+        self.api_client
+            .rename(&old_str, &new_str)
+            .map_err(|e| posix_to_ntstatus(e.errno))?;
+        self.invalidate_path(&old_str);
+        self.invalidate_path(&new_str);
+        Ok(())
     }
 
     fn get_volume_information(&'h self, _info: &OperationInfo<'c, 'h, Self>) -> OperationResult<VolumeInfo> {
         Ok(VolumeInfo {
-            name: U16CString::from_str("RemoteFS").unwrap(),
+            name: U16CString::from_str("RemoteFS").map_err(|_| STATUS_IO_DEVICE_ERROR)?,
             serial_number: 12345,
             max_component_length: 255,
-            fs_flags: 0, 
-            fs_name: U16CString::from_str("NTFS").unwrap(),
+            fs_flags: 0,
+            fs_name: U16CString::from_str("NTFS").map_err(|_| STATUS_IO_DEVICE_ERROR)?,
         })
     }
 
@@ -235,45 +500,60 @@ impl<'c, 'h> FileSystemHandler<'c, 'h> for RemoteFilesystem where 'h: 'c {
         })
     }
 
-    fn set_end_of_file(&'h self, _file_name: &U16CStr, _offset: i64, _info: &OperationInfo<'c, 'h, Self>, _context: &'c Self::Context) -> OperationResult<()> {
+    fn set_end_of_file(
+        &'h self,
+        _file_name: &U16CStr,
+        _offset: i64,
+        _info: &OperationInfo<'c, 'h, Self>,
+        _context: &'c Self::Context,
+    ) -> OperationResult<()> {
         Ok(())
     }
 
-    fn set_allocation_size(&'h self, _file_name: &U16CStr, _alloc_size: i64, _info: &OperationInfo<'c, 'h, Self>, _context: &'c Self::Context) -> OperationResult<()> {
-        Ok(())
-    }
-
-    fn mounted(&'h self, _mount_point: &U16CStr, _info: &OperationInfo<'c, 'h, Self>) -> OperationResult<()> {
-        println!("[DOKAN] File System successfully mounted!");
+    fn set_allocation_size(
+        &'h self,
+        _file_name: &U16CStr,
+        _alloc_size: i64,
+        _info: &OperationInfo<'c, 'h, Self>,
+        _context: &'c Self::Context,
+    ) -> OperationResult<()> {
         Ok(())
     }
 }
 
-pub fn run_dokany_client(fs: Arc<RemoteFilesystem>, mountpoint: String) {
-    dokan::init(); 
+pub fn run_dokany_client(api_client: ApiClient, mountpoint: String) -> Result<()> {
+    dokan::init();
 
-    let mp = match U16CString::from_str(&mountpoint) {
-        Ok(mp) => mp,
-        Err(_) => {
-            eprintln!("Invalid mountpoint");
-            return;
-        }
+    let mountpoint = if mountpoint.ends_with(':') {
+        format!("{}\\", mountpoint)
+    } else {
+        mountpoint
     };
-    
+    let mp = U16CString::from_str(&mountpoint)?;
+
+    // 1. Usiamo un Arc esplicito. Questo garantisce che l'oggetto 
+    // non si muova e che l'indirizzo di memoria sia stabile.
+    let fs = Arc::new(DokanyFs {
+        api_client: Arc::new(api_client),
+        ino_counter: Mutex::new(2),
+        cache: Mutex::new(CacheManager::new()),
+        last_cleanup: Mutex::new(Instant::now()),
+    });
+
     let mut options = MountOptions::default();
     options.single_thread = false;
     
+    // 2. Passiamo il riferimento dell'Arc
     let mut mounter = FileSystemMounter::new(&*fs, mp.as_ucstr(), &options);
     
-    println!("[DOKAN] Mounting on {}...", mountpoint);
-    
+    log::info!("Mounting on {}...", mountpoint);
+
     match mounter.mount() {
-        Ok(_) => {
+        Ok(_fs_instance) => {
+            log::info!("Successfully mounted on {}", mountpoint);
+            log::info!("Press Ctrlc+C to unmount.");
+            Ok(())
         }
-        Err(e) => {
-            eprintln!("[DOKAN] Error during execution: {:?}", e);
-        }
+        Err(e) => Err(anyhow::anyhow!("Dokany mount failed: {:?}", e)),
     }
-    
-    dokan::shutdown();
 }

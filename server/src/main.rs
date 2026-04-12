@@ -8,7 +8,7 @@ use actix_cors::Cors;
 use local_ip_address::local_ip;
 use log::{info, warn};
 
-mod handlers;
+mod apis;
 
 fn storage_root() -> String {
     env::var("STORAGE_ROOT").unwrap_or_else(|_| "mnt/remote-fs".to_string())
@@ -47,22 +47,22 @@ async fn main() -> std::io::Result<()> {
         App::new()
             .wrap(Logger::default())
             .app_data(web::Data::new(
-                handlers::AppState {
+                apis::AppState {
                     root_dir: root_dir.clone(),
                 }
             ))
             .wrap(cors)
-            .route("/", web::get().to(handlers::index))
-            .route("/list/{path:.*}", web::get().to(handlers::list_directory))
-            .route("/files/{path:.*}", web::get().to(handlers::read_file))
-            .route("/files/{path:.*}", web::put().to(handlers::write_file))
-            .route("/files/{path:.*}", web::patch().to(handlers::patch_file))
-            .route("/files/{path:.*}", web::head().to(handlers::file_info))
-            .route("/mkdir/{path:.*}", web::post().to(handlers::create_directory))
-            .route("/files/{path:.*}", web::delete().to(handlers::delete_file))
-            .route("/rename", web::post().to(handlers::rename_entry))
-            .route("/attrs/{path:.*}", web::patch().to(handlers::set_attrs))
-            .route("/health", web::get().to(handlers::health))
+            .route("/", web::get().to(apis::index))
+            .route("/list/{path:.*}", web::get().to(apis::list_directory))
+            .route("/files/{path:.*}", web::get().to(apis::read_file))
+            .route("/files/{path:.*}", web::put().to(apis::write_file))
+            .route("/files/{path:.*}", web::patch().to(apis::patch_file))
+            .route("/files/{path:.*}", web::head().to(apis::file_info))
+            .route("/mkdir/{path:.*}", web::post().to(apis::create_directory))
+            .route("/files/{path:.*}", web::delete().to(apis::delete_file))
+            .route("/rename", web::post().to(apis::rename_entry))
+            .route("/attrs/{path:.*}", web::patch().to(apis::set_attrs))
+            .route("/health", web::get().to(apis::health))
     })
     .bind(&addr)?
     .run();
