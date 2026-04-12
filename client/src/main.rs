@@ -43,14 +43,14 @@ fn main() -> Result<()> {
     {
         let mount_for_signal = mount_point.clone();
         ctrlc::set_handler(move || {
-            info!("Ctrl+C ricevuto, smontaggio Dokany in corso...");
+            info!("Dokan shutdown on going...");
             match U16CString::from_str(&mount_for_signal) {
                 Ok(mp) => {
                     if !unmount(mp.as_ucstr()) {
-                        log::warn!("Unmount Dokany non riuscito su {}", mount_for_signal);
+                        log::warn!("Dokan unmount failed {}", mount_for_signal);
                     }
                 }
-                Err(_) => log::warn!("Mount point non valido per unmount: {}", mount_for_signal),
+                Err(_) => log::warn!("Invalid unmount mountpoint: {}", mount_for_signal),
             }
         })
         .context("Failed to install Ctrl+C handler")?;
