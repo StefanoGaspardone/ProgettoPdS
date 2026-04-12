@@ -11,14 +11,133 @@ use crate::apis::ApiClient;
 use dotenvy::dotenv;
 use log::info;
 use std::env;
+use std::fs;
+use std::path::PathBuf;
+use std::process::Stdio;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::process::{self, Command};
 #[cfg(target_os = "windows")]
 use dokan::unmount;
 #[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+#[cfg(target_os = "windows")]
 use widestring::U16CString;
 
+const ARG_DAEMON: &str = "--daemon";
+const ARG_FOREGROUND: &str = "--foreground";
+const ARG_STOP: &str = "--stop";
+
+fn pid_file_path() -> PathBuf {
+    std::env::temp_dir().join("remotefs-client.pid")
+}
+
+fn write_pid_file(pid: u32) -> Result<()> {
+    fs::write(pid_file_path(), pid.to_string()).context("Failed to write pid file")
+}
+
+fn read_pid_file() -> Result<u32> {
+    let pid_raw = fs::read_to_string(pid_file_path()).context("Daemon pid file not found")?;
+    let pid = pid_raw
+        .trim()
+        .parse::<u32>()
+        .context("Invalid pid file content")?;
+    Ok(pid)
+}
+
+fn remove_pid_file() {
+    let _ = fs::remove_file(pid_file_path());
+}
+
+fn should_stop_daemon() -> bool {
+    env::args().any(|a| a == ARG_STOP)
+}
+
+fn stop_daemon() -> Result<()> {
+    let pid = read_pid_file()?;
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let rc = unsafe { libc::kill(pid as i32, libc::SIGINT) };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ESRCH) {
+                remove_pid_file();
+                println!("No running daemon found (stale pid file removed)");
+                return Ok(());
+            }
+            return Err(anyhow::anyhow!("Failed to signal daemon pid {}: {}", pid, err));
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let status = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .status()
+            .context("Failed to execute taskkill")?;
+
+        if !status.success() {
+            return Err(anyhow::anyhow!("taskkill failed for pid {} with status {}", pid, status));
+        }
+    }
+
+    remove_pid_file();
+    println!("Client daemon stop requested for pid {}", pid);
+    Ok(())
+}
+
+fn should_daemonize() -> bool {
+    let has_daemon = env::args().any(|a| a == ARG_DAEMON);
+    let is_foreground_child = env::args().any(|a| a == ARG_FOREGROUND);
+    has_daemon && !is_foreground_child
+}
+
+fn spawn_daemon_child() -> Result<()> {
+    let current_exe = env::current_exe().context("Failed to resolve current executable")?;
+    let args: Vec<String> = env::args().skip(1).filter(|a| a != ARG_DAEMON).collect();
+
+    let mut cmd = std::process::Command::new(current_exe);
+    cmd.args(args)
+        .arg(ARG_FOREGROUND)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    #[cfg(target_os = "windows")]
+    {
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
+    let child = cmd.spawn().context("Failed to spawn daemon child process")?;
+    write_pid_file(child.id())?;
+    println!("Client daemon started with pid {}", child.id());
+    Ok(())
+}
+
 fn main() -> Result<()> {
+    if should_stop_daemon() {
+        return stop_daemon();
+    }
+
+    if should_daemonize() {
+        return spawn_daemon_child();
+    }
+
     dotenv().ok();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
