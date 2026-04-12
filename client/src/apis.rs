@@ -44,7 +44,8 @@ impl ApiClient {
 
     pub fn new(base_url: String, runtime: Handle) -> Result<Self> {
         let client = Client::builder()
-            .timeout(Duration::from_secs(5))
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(60))
             .build()
             .context("Failed to create HTTP client")?;
 
@@ -111,22 +112,22 @@ impl ApiClient {
             return Ok(Vec::new());
         }
 
-        let url = format!("{}/files/{}", self.base_url, path.trim_start_matches('/'));
-        let end = offset
-            .checked_add(size as u64 - 1)
-            .ok_or_else(|| ApiError::io_error("read_file_chunk", "Invalid range overflow"))?;
+        let url = format!(
+            "{}/files/{}?offset={}&size={}",
+            self.base_url,
+            path.trim_start_matches('/'),
+            offset,
+            size
+        );
 
-        log::debug!("Reading file chunk: {} (offset={}, size={})", url, offset, size);
+        log::info!("[API] read_file_chunk path={} offset={} size={}", path, offset, size);
 
-        let response = self.block_on(
-            self.client.get(&url)
-                .header("Range", format!("bytes={}-{}", offset, end))
-                .send()
-        ).map_err(|e| ApiError::from_network_error("read_file_chunk", &e))?;
+        let response = self.block_on(self.client.get(&url).send())
+            .map_err(|e| ApiError::from_network_error("read_file_chunk", &e))?;
 
         let status = response.status();
-        if !status.is_success() && status.as_u16() != 206 {
-            log::warn!("read_file_chunk failed for {}: HTTP {}", path, status);
+        if !status.is_success() {
+            log::warn!("[API] read_file_chunk failed path={} offset={} size={} status={}", path, offset, size, status);
             return Err(ApiError::from_status(status, "read_file_chunk"));
         }
 
@@ -139,7 +140,7 @@ impl ApiClient {
             bytes.to_vec()
         };
 
-        log::debug!("Read {} bytes from offset {}", result.len(), offset);
+        log::info!("[API] read_file_chunk ok path={} offset={} requested={} returned={}", path, offset, size, result.len());
         Ok(result)
     }
 

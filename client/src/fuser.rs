@@ -315,10 +315,12 @@ impl Filesystem for FuserFS {
 
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let _guard = self.api_client.enter_runtime();
+        log::info!("[FUSE] lookup parent={} name={}", parent.0, name.to_string_lossy());
 
         let path = match self.inode_table.read().unwrap().child_path(parent.0, name) {
             Some(p) => p,
             None => {
+                log::warn!("[FUSE] lookup failed: invalid child path parent={} name={}", parent.0, name.to_string_lossy());
                 reply.error(as_errno(ENOENT));
                 return;
             }
@@ -338,6 +340,7 @@ impl Filesystem for FuserFS {
         let parent_path = match self.inode_table.read().unwrap().get_cloned(parent.0) {
             Some(inode) => inode.path,
             None => {
+                log::warn!("[FUSE] lookup failed: parent inode not found {}", parent.0);
                 reply.error(as_errno(ENOENT));
                 return;
             }
@@ -547,10 +550,12 @@ impl Filesystem for FuserFS {
 
     fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
         let _guard = self.api_client.enter_runtime();
+        log::info!("[FUSE] open ino={}", ino.0);
 
         let path = match self.inode_table.read().unwrap().get_cloned(ino.0) {
             Some(inode) => inode.path,
             None => {
+                log::warn!("[FUSE] open failed: inode {} not found", ino.0);
                 reply.error(as_errno(ENOENT));
                 return;
             }
@@ -571,6 +576,7 @@ impl Filesystem for FuserFS {
         reply: ReplyEmpty,
     ) {
         let _guard = self.api_client.enter_runtime();
+        log::info!("[FUSE] release fh={}", fh.0);
 
         self.file_handles.lock().unwrap().close(fh.0);
         reply.ok();
@@ -579,11 +585,12 @@ impl Filesystem for FuserFS {
     fn flush(
         &self,
         _req: &Request,
-        _ino: INodeNo,
-        _fh: FileHandle,
-        _lock_owner: LockOwner,
+        ino: INodeNo,
+        fh: FileHandle,
+        lock_owner: LockOwner,
         reply: ReplyEmpty,
     ) {
+        log::info!("[FUSE] flush ino={} fh={} lock_owner={:?}", ino.0, fh.0, lock_owner);
         reply.ok();
     }
 
@@ -599,16 +606,21 @@ impl Filesystem for FuserFS {
         reply: ReplyData,
     ) {
         let _guard = self.api_client.enter_runtime();
+        log::info!("[FUSE] read ino={} offset={} size={}", ino.0, offset, size);
 
         let inode = match self.inode_table.read().unwrap().get_cloned(ino.0) {
             Some(inode) => inode,
             None => {
+                log::warn!("[FUSE] read failed: inode {} not found", ino.0);
                 reply.error(as_errno(ENOENT));
                 return;
             }
         };
 
+        log::info!("[FUSE] read path={} file_size={}", inode.path, inode.attr.size);
+
         if offset >= inode.attr.size {
+            log::info!("[FUSE] read EOF path={} offset={} size={}", inode.path, offset, size);
             reply.data(&[]);
             return;
         }
@@ -618,6 +630,14 @@ impl Filesystem for FuserFS {
             match cache.read_with_cache(&inode.path, offset_u64, size, &self.api_client) {
                 Ok(d) => d,
                 Err(e) => {
+                    log::warn!(
+                        "[FUSE] read cache path={} offset={} size={} errno={} err={}",
+                        inode.path,
+                        offset_u64,
+                        size,
+                        e.errno,
+                        e
+                    );
                     reply.error(as_errno(e.errno));
                     return;
                 }
@@ -626,12 +646,21 @@ impl Filesystem for FuserFS {
             match self.api_client.read_file_chunk(&inode.path, offset_u64, size) {
                 Ok(d) => d,
                 Err(e) => {
+                    log::warn!(
+                        "[FUSE] read direct path={} offset={} size={} errno={} err={}",
+                        inode.path,
+                        offset_u64,
+                        size,
+                        e.errno,
+                        e
+                    );
                     reply.error(as_errno(e.errno));
                     return;
                 }
             }
         };
 
+        log::info!("[FUSE] read ok path={} requested={} returned={}", inode.path, size, data.len());
         reply.data(&data);
     }
 
@@ -880,7 +909,8 @@ impl Filesystem for FuserFS {
         }
     }
 
-    fn getxattr(&self, _req: &Request, _ino: INodeNo, _name: &OsStr, size: u32, reply: ReplyXattr) {
+    fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
+        log::info!("[FUSE] getxattr ino={} name={} size={}", ino.0, name.to_string_lossy(), size);
         if size == 0 {
             reply.size(0);
         } else {
@@ -888,7 +918,8 @@ impl Filesystem for FuserFS {
         }
     }
 
-    fn listxattr(&self, _req: &Request, _ino: INodeNo, size: u32, reply: ReplyXattr) {
+    fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
+        log::info!("[FUSE] listxattr ino={} size={}", ino.0, size);
         if size == 0 {
             reply.size(0);
         } else {

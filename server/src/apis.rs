@@ -50,6 +50,12 @@ pub struct SetAttrsRequest {
     pub mode: Option<u32>,
 }
 
+#[derive(Deserialize)]
+pub struct ReadQuery {
+    pub offset: Option<u64>,
+    pub size: Option<u64>,
+}
+
 fn fs_error_json(err: &std::io::Error, message: &'static str) -> HttpResponse {
     match err.kind() {
         ErrorKind::NotFound => HttpResponse::NotFound().json(message),
@@ -183,7 +189,8 @@ pub async fn list_directory(
 
 pub async fn read_file(
     req: HttpRequest,
-    data: web::Data<AppState>
+    data: web::Data<AppState>,
+    query: web::Query<ReadQuery>,
 ) -> Result<HttpResponse> {
     let path = req.match_info().query("path");
     let full_path = match get_safe_path(&data.root_dir, path) {
@@ -199,6 +206,49 @@ pub async fn read_file(
     if full_path.is_dir() {
         warn!("[GET /files] is directory: {}", full_path.display());
         return Ok(HttpResponse::BadRequest().json("Is a directory"));
+    }
+
+    if query.offset.is_some() || query.size.is_some() {
+        let offset = query.offset.unwrap_or(0);
+        let size = query.size.unwrap_or(128 * 1024);
+
+        info!(
+            "[GET /files] {} query offset={} size={}",
+            full_path.display(),
+            offset,
+            size
+        );
+
+        let mut file = match fs::File::open(&full_path) {
+            Ok(f) => f,
+            Err(e) => return Ok(fs_error_json(&e, "Failed to open file")),
+        };
+
+        let file_size = match file.metadata() {
+            Ok(m) => m.len(),
+            Err(e) => return Ok(fs_error_json(&e, "Failed to stat file")),
+        };
+
+        if offset >= file_size {
+            return Ok(HttpResponse::Ok()
+                .content_type("application/octet-stream")
+                .body(Vec::<u8>::new()));
+        }
+
+        let to_read = std::cmp::min(size, file_size - offset) as usize;
+        let mut buf = vec![0u8; to_read];
+
+        if let Err(e) = file.seek(SeekFrom::Start(offset)) {
+            return Ok(fs_error_json(&e, "Failed to seek"));
+        }
+
+        if let Err(e) = file.read_exact(&mut buf) {
+            return Ok(fs_error_json(&e, "Failed to read requested chunk"));
+        }
+
+        return Ok(HttpResponse::Ok()
+            .content_type("application/octet-stream")
+            .body(buf));
     }
 
     if let Some(range_header) = req.headers().get("Range") {
