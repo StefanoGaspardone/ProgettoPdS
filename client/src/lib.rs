@@ -83,21 +83,21 @@ impl RemoteFilesystem {
     async fn fetch_range(&self, path_clean: &str, offset: u64, size: usize) -> Result<Vec<u8>, i32> {
         println!("[DEBUG] fetch_range() requesting -> {} | offset: {} | size: {}", path_clean, offset, size);
 
-        let url_str = format!("files/{}?offset={}&size={}", path_clean, offset, size);
-        let url = self.server_url.join(&url_str).map_err(|_| EIO)?;
+        let url = self.server_url.join(&format!("files/{}", path_clean)).map_err(|_| EIO)?;
+        let range_header = format!("bytes={}-{}", offset, offset + size as u64 - 1);
 
         let resp = self.http_client.get(url)
+            .header("Range", range_header)
             .send()
             .await
             .map_err(map_net_error)?;
 
-        if !resp.status().is_success() {
+        if !resp.status().is_success() && resp.status() != 206 {
             println!("[ERROR] fetch_range() failed with status {}", resp.status());
             return Err(EIO);
         }
 
         let bytes = resp.bytes().await.map_err(map_net_error)?;
-        println!("[DEBUG] fetch_range() downloaded bytes: {}", bytes.len());
         Ok(bytes.to_vec())
     }
 

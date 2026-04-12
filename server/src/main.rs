@@ -1,5 +1,5 @@
 use axum::body::Body;
-use axum::http::StatusCode;
+use axum::http::{Request, StatusCode, header};
 use axum::response::IntoResponse;
 use axum::{Json, Router};
 use axum::routing::{get, post};
@@ -100,35 +100,62 @@ async fn list_dir(path: Option<Path<String>>) -> Json<Vec<FileInfo>> {
     Json(files)
 }
 
-async fn read_file(path: Option<Path<String>>, Query(params): Query<ReadParams>) -> impl IntoResponse {
+async fn read_file(path: Option<Path<String>>, req: Request<axum::body::Body>) -> impl IntoResponse {
     let file_path = path.map(|Path(p)| p).unwrap_or_default();
     let relative_path = file_path.trim_start_matches('/');
-
     let full_path = storage_root().join(relative_path);
 
     let mut file = match fs::File::open(&full_path).await {
         Ok(f) => f,
-        Err(_) => return StatusCode::NOT_FOUND.into_response(), 
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
 
-    let offset = params.offset.unwrap_or(0);
-    if offset > 0 {
-        if let Err(_) = file.seek(SeekFrom::Start(offset)).await {
-            return axum::http::StatusCode::BAD_REQUEST.into_response();
+    let metadata = file.metadata().await.unwrap();
+    let file_size = metadata.len();
+
+    let range = req.headers()
+        .get(header::RANGE)
+        .and_then(|v| v.to_str().ok());
+
+    if let Some(range_str) = range {
+        if let Some((start, mut end)) = parse_range_header(range_str) {
+            if end >= file_size {
+                end = file_size.saturating_sub(1);
+            }
+            
+            if start >= file_size {
+                return StatusCode::RANGE_NOT_SATISFIABLE.into_response();
+            }
+
+            let size_to_read = (end - start + 1) as usize;
+            if let Err(_) = file.seek(SeekFrom::Start(start)).await {
+                return StatusCode::BAD_REQUEST.into_response();
+            }
+
+            let mut buffer = vec![0u8; size_to_read];
+            if let Ok(_) = file.read_exact(&mut buffer).await {
+                println!("[GET /files] Range: {}-{} ({} bytes) | File: {}", start, end, size_to_read, relative_path);
+                return (StatusCode::PARTIAL_CONTENT, buffer).into_response();
+            }
         }
     }
 
-    println!("\n[GET /files] /{} with offset: {} and size: {:?}", relative_path, offset, params.size);
+    println!("[GET /files] Full stream: {}", relative_path);
+    
+    let stream = ReaderStream::new(file);
+    Body::from_stream(stream).into_response()
+}
 
-    if let Some(size) = params.size {
-        let handle = file.take(size);
-        let stream = ReaderStream::with_capacity(handle, 64 * 1024); // Buffer da 64KB per lo streaming
-        
-        Body::from_stream(stream).into_response()
-    } else {
-        let stream = ReaderStream::with_capacity(file, 256 * 1024); // Large 256KB read ahead buffer
-        Body::from_stream(stream).into_response()
-    }
+fn parse_range_header(range: &str) -> Option<(u64, u64)> {
+    if !range.starts_with("bytes=") { return None; }
+    
+    let parts: Vec<&str> = range["bytes=".len()..].split('-').collect();
+    if parts.len() != 2 { return None; }
+    
+    let start = parts[0].parse::<u64>().ok()?;
+    let end = parts[1].parse::<u64>().ok()?;
+    
+    Some((start, end))
 }
 
 async fn get_stat(path: Option<Path<String>>) -> impl IntoResponse {

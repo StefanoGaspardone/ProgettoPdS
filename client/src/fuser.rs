@@ -114,14 +114,22 @@ impl Filesystem for FuseAdapter {
         self.fs.runtime_handle.block_on(async {
             if let Some(path) = self.fs.get_path_by_ino(ino.into()).await {
                 match self.fs.read_file(&path, offset as u64, size).await {
-                    Ok(data) => reply.data(&data),
-                    Err(e) => reply.error(Errno::from_i32(e)),
+                    Ok(data) => {
+                        let end = std::cmp::min(data.len(), size as usize);
+                        reply.data(&data[..end]);
+                    },
+                    Err(e) => {
+                        if e == libc::ETIMEDOUT {
+                            println!("[FUSE] Timeout leggendo {}", path);
+                        }
+                        reply.error(Errno::from_i32(e));
+                    }
                 }
             } else {
                 reply.error(Errno::from_i32(ENOENT));
             }
         });
-    }
+    }   
 
     fn write(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64, data: &[u8], _write_flags: WriteFlags, _flags: OpenFlags, _lock: Option<LockOwner>, reply: ReplyWrite) {
         self.fs.runtime_handle.block_on(async {
@@ -245,7 +253,7 @@ pub fn run_fuser_client(fs: Arc<RemoteFilesystem>, mountpoint: String) {
     options.mount_options = vec![
         MountOption::RW,
         MountOption::FSName("remote-file-system".to_string()),
-        MountOption::CUSTOM("auto_cache".to_string()),
+        MountOption::CUSTOM("auto_cache".to_string())
     ];
 
     mount2(FuseAdapter { fs }, &mountpoint, &options).expect("Mount failed");
