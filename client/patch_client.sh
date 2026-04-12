@@ -1,1 +1,0 @@
-sed -i 's/const READ_CHUNK_SIZE: usize = 8 \* 1024 \* 1024;/const READ_CHUNK_SIZE: usize = 1024 \* 1024;/' /home/user/Documents/PoliTO/Magistrale/Anno\ I/Programmazione\ di\ Sistema/ProgettoPdS/client/src/lib.rs
