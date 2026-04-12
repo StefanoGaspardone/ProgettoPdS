@@ -121,10 +121,16 @@ async fn read_file(path: Option<Path<String>>, Query(params): Query<ReadParams>)
     println!("\n[GET /files] /{} with offset: {} and size: {:?}", relative_path, offset, params.size);
 
     if let Some(size) = params.size {
-        let stream = ReaderStream::new(file.take(size));
-        axum::body::Body::from_stream(stream).into_response()
+        // Read directly into a pre-allocated buffer for maximum efficiency
+        let actual_size = std::cmp::min(size, 32 * 1024 * 1024) as usize; // Max 32MB in RAM at once
+        let mut buf = Vec::with_capacity(actual_size);
+        let mut handle = file.take(size);
+        if let Err(_) = handle.read_to_end(&mut buf).await {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        axum::body::Body::from(buf).into_response()
     } else {
-        let stream = ReaderStream::new(file);
+        let stream = ReaderStream::with_capacity(file, 256 * 1024); // Large 256KB read ahead buffer
         axum::body::Body::from_stream(stream).into_response()
     }
 }

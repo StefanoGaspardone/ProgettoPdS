@@ -69,7 +69,7 @@ pub struct RemoteFilesystem {
 }
 
 impl RemoteFilesystem {
-    const READ_CHUNK_SIZE: usize = 1024 * 1024; // 1 MiB
+    const READ_CHUNK_SIZE: usize = 8 * 1024 * 1024; // 8 MiB chunk for maximum speed
 
     fn endpoint_for_path(prefix: &str, path_clean: &str) -> String {
         if path_clean.is_empty() {
@@ -98,23 +98,21 @@ impl RemoteFilesystem {
 
     async fn fetch_chunk(&self, path_clean: &str, chunk_start: u64) -> Result<Arc<Vec<u8>>, i32> {
         let chunk_key = format!("{}:{}", path_clean, chunk_start);
+        let path_clone = path_clean.to_string();
 
-        if let Some(cached) = self.read_cache.get(&chunk_key).await {
-            return Ok(cached);
-        }
-
-        let data = self.fetch_range(path_clean, chunk_start, Self::READ_CHUNK_SIZE).await?;
-        let chunk = Arc::new(data);
-        self.read_cache.insert(chunk_key, chunk.clone()).await;
-        Ok(chunk)
+        self.read_cache.try_get_with(chunk_key, async move {
+            let data = self.fetch_range(&path_clone, chunk_start, Self::READ_CHUNK_SIZE).await?;
+            Ok::<Arc<Vec<u8>>, i32>(Arc::new(data))
+        }).await.map_err(|e| *e)
     }
 
     pub fn new(server_url: &str) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
         let url = Url::parse(server_url)?;
         
         let http_client = Client::builder()
-            .timeout(Duration::from_secs(5))
-            .connect_timeout(Duration::from_secs(2))
+            //.timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(10))
+            .tcp_keepalive(Duration::from_secs(60))
             .build()?;
         
         let runtime = global_runtime();
@@ -268,25 +266,39 @@ impl RemoteFilesystem {
     }
 
     pub async fn read_file(&self, path: &str, offset: u64, size: u32) -> Result<Vec<u8>, i32> {
-        if !self.is_online.load(Ordering::SeqCst) { return Err(ENOTCONN); }
+        if !self.is_online.load(Ordering::SeqCst) {
+            return Err(ENOTCONN); 
+        }
+
         let path_clean = path.trim_start_matches('/');
-        if size == 0 { return Ok(Vec::new()); }
+        
+        if size == 0 {
+            return Ok(Vec::new());
+        }
 
         let requested = size as usize;
+        
         let mut out = Vec::with_capacity(requested);
-        let mut current_offset = offset;
         let mut remaining = requested;
+        let mut current_offset = offset;
 
         while remaining > 0 {
             let chunk_start = (current_offset / Self::READ_CHUNK_SIZE as u64) * Self::READ_CHUNK_SIZE as u64;
             let offset_in_chunk = (current_offset - chunk_start) as usize;
 
-            let chunk = self.fetch_chunk(path_clean, chunk_start).await?;
+            self.prefetch_next_chunk(path_clean.to_string(), chunk_start + Self::READ_CHUNK_SIZE as u64).await;
+            
+            let chunk = match self.fetch_chunk(path_clean, chunk_start).await {
+                Ok(cached) => cached,
+                Err(_) => {
+                    self.read_cache.invalidate_all();
+                    return self.fetch_range(path_clean, offset, requested).await;
+                }
+            };
 
-            let next_chunk_start = chunk_start + Self::READ_CHUNK_SIZE as u64;
-            self.prefetch_next_chunk(path_clean.to_string(), next_chunk_start).await;
-
-            if offset_in_chunk >= chunk.len() { break; }
+            if offset_in_chunk >= chunk.len() {
+                break;
+            }
 
             let to_take = min(remaining, chunk.len() - offset_in_chunk);
             out.extend_from_slice(&chunk[offset_in_chunk..offset_in_chunk + to_take]);
@@ -294,7 +306,9 @@ impl RemoteFilesystem {
             remaining -= to_take;
             current_offset += to_take as u64;
 
-            if chunk.len() < Self::READ_CHUNK_SIZE { break; }
+            if chunk.len() < Self::READ_CHUNK_SIZE {
+                break;
+            }
         }
 
         Ok(out)
@@ -414,29 +428,34 @@ impl RemoteFilesystem {
 
         let chunk_key = format!("{}:{}", path_clean, next_chunk_start);
         
-        if self.read_cache.get(&chunk_key).await.is_none() {
-            let self_clone = self.http_client.clone();
-            let url_base = self.server_url.clone();
-            let cache = self.read_cache.clone();
-            let shutdown = self.shutdown.clone();
-            
-            self.runtime_handle.spawn(async move {
-                if shutdown.load(Ordering::SeqCst) {
-                    return;
-                }
-
-                let url_str = format!("files/{}?offset={}&size={}", path_clean, next_chunk_start, Self::READ_CHUNK_SIZE);
-                if let Ok(url) = url_base.join(&url_str) {
-                    if let Ok(resp) = self_clone.get(url).send().await {
-                        if resp.status().is_success() {
-                            if let Ok(bytes) = resp.bytes().await {
-                                cache.insert(chunk_key, Arc::new(bytes.to_vec())).await;
-                            }
-                        }
-                    }
-                }
-            });
+        if self.read_cache.contains_key(&chunk_key) {
+            return;
         }
+
+        let self_clone = self.http_client.clone();
+        let url_base = self.server_url.clone();
+        let cache = self.read_cache.clone();
+        let shutdown = self.shutdown.clone();
+        
+        self.runtime_handle.spawn(async move {
+            if shutdown.load(Ordering::SeqCst) {
+                return;
+            }
+
+            let _ = cache.try_get_with(chunk_key, async move {
+                let url_str = format!("files/{}?offset={}&size={}", path_clean, next_chunk_start, Self::READ_CHUNK_SIZE);
+                let url = url_base.join(&url_str).map_err(|_| EIO)?;
+                
+                let resp = self_clone.get(url).send().await.map_err(|_| EIO)?;
+                
+                if resp.status().is_success() {
+                    let bytes = resp.bytes().await.map_err(|_| EIO)?;
+                    Ok::<Arc<Vec<u8>>, i32>(Arc::new(bytes.to_vec()))
+                } else {
+                    Err::<Arc<Vec<u8>>, i32>(EIO)
+                }
+            }).await;
+        });
     }
 }
 
