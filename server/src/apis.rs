@@ -7,6 +7,7 @@ use actix_web::http::header::{HeaderName, HeaderValue};
 use futures_util::StreamExt;
 use tokio_util::io::ReaderStream;
 use tokio::io::AsyncWriteExt;
+use log::{info, warn};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::fs::OpenOptions;
 
@@ -191,20 +192,27 @@ pub async fn read_file(
     };
 
     if !full_path.exists() {
+        warn!("[GET /files] not found: {}", full_path.display());
         return Ok(HttpResponse::NotFound().json("File not found"));
     }
 
     if full_path.is_dir() {
+        warn!("[GET /files] is directory: {}", full_path.display());
         return Ok(HttpResponse::BadRequest().json("Is a directory"));
     }
 
     if let Some(range_header) = req.headers().get("Range") {
         let range_str = range_header.to_str().unwrap_or("");
+        info!("[GET /files] {} range={}", full_path.display(), range_str);
         
         if let Some((start, end)) = parse_range(range_str) {
             return handle_range_request(&full_path, start, end).await;
         }
+
+        warn!("[GET /files] invalid range header: {}", range_str);
     }
+
+    info!("[GET /files] {} full-file stream", full_path.display());
 
     match tokio::fs::File::open(&full_path).await {
         Ok(file) => {
@@ -529,8 +537,22 @@ async fn handle_range_request(
     let actual_end = actual_end.min(file_size - 1);
     
     if start > actual_end {
+        warn!(
+            "[GET /files] invalid range for {}: start={} end={}",
+            file_path.display(),
+            start,
+            actual_end
+        );
         return Ok(HttpResponse::RangeNotSatisfiable().finish());
     }
+
+    info!(
+        "[GET /files] {} bytes {}-{} / {}",
+        file_path.display(),
+        start,
+        actual_end,
+        file_size
+    );
     
     let mut buffer = vec![0; (actual_end - start + 1) as usize];
     file.seek(std::io::SeekFrom::Start(start))?;

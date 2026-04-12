@@ -11,6 +11,8 @@ use crate::apis::ApiClient;
 use dotenvy::dotenv;
 use log::info;
 use std::env;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::process::{self, Command};
 #[cfg(target_os = "windows")]
 use dokan::unmount;
 #[cfg(target_os = "windows")]
@@ -52,6 +54,52 @@ fn main() -> Result<()> {
                 }
                 Err(_) => log::warn!("Invalid unmount mountpoint: {}", mount_for_signal),
             }
+        })
+        .context("Failed to install Ctrl+C handler")?;
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let mount_for_signal = mount_point.clone();
+        ctrlc::set_handler(move || {
+            info!("FUSE shutdown in progress...");
+
+            #[cfg(target_os = "linux")]
+            {
+                match Command::new("fusermount")
+                    .arg("-u")
+                    .arg("-z")
+                    .arg(&mount_for_signal)
+                    .status()
+                {
+                    Ok(status) if status.success() => {
+                        info!("FUSE unmounted successfully: {}", mount_for_signal);
+                    }
+                    Ok(status) => {
+                        log::warn!("FUSE unmount returned non-zero status {status}: {}", mount_for_signal);
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to run fusermount for {}: {}", mount_for_signal, e);
+                    }
+                }
+            }
+
+            #[cfg(target_os = "macos")]
+            {
+                match Command::new("umount").arg(&mount_for_signal).status() {
+                    Ok(status) if status.success() => {
+                        info!("FUSE unmounted successfully: {}", mount_for_signal);
+                    }
+                    Ok(status) => {
+                        log::warn!("umount returned non-zero status {status}: {}", mount_for_signal);
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to run umount for {}: {}", mount_for_signal, e);
+                    }
+                }
+            }
+
+            process::exit(0);
         })
         .context("Failed to install Ctrl+C handler")?;
     }

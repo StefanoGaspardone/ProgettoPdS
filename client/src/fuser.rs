@@ -1,20 +1,27 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::Path;
+use std::process::Command;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use crate::apis::{ApiClient, FileEntry};
 use fuser::{
-    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyWrite, Request, Session, SessionUnmounter,
+    BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
+    Generation, INodeNo, LockOwner, MountOption, OpenFlags, RenameFlags, ReplyAttr,
+    ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite,
+    ReplyXattr, Request, SessionACL, WriteFlags, mount2,
 };
 use libc::ENOENT;
 
-use crate::cache::{CacheManager, CHUNK_SIZE, METADATA_CACHE_TTL};
+use crate::cache::{CacheManager, METADATA_CACHE_TTL};
 
 const FUSE_TTL: Duration = Duration::from_secs(1);
+
+fn as_errno(code: i32) -> Errno {
+    Errno::from_i32(code)
+}
 
 #[derive(Debug, Clone)]
 struct INode {
@@ -49,7 +56,7 @@ impl InodeTable {
         };
 
         let root_attr = FileAttr {
-            ino: 1,
+            ino: INodeNo(1),
             size: 0,
             blocks: 0,
             atime: SystemTime::now(),
@@ -108,7 +115,7 @@ impl InodeTable {
         };
 
         let attr = FileAttr {
-            ino,
+            ino: INodeNo(ino),
             size: entry.size,
             blocks: entry.size.div_ceil(512),
             atime: UNIX_EPOCH + Duration::from_secs_f64(entry.mtime),
@@ -235,7 +242,7 @@ impl PathLockManager {
     }
 }
 
-pub struct RemoteFS {
+pub struct FuserFS {
     api_client: Arc<ApiClient>,
     inode_table: Arc<RwLock<InodeTable>>,
     file_handles: Arc<Mutex<FileHandleTable>>,
@@ -243,7 +250,7 @@ pub struct RemoteFS {
     path_locks: Arc<PathLockManager>,
 }
 
-impl RemoteFS {
+impl FuserFS {
     pub fn new(api_client: ApiClient) -> Self {
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
@@ -265,44 +272,34 @@ impl RemoteFS {
     pub fn mount(
         self,
         mountpoint: &Path,
-        unmounter_slot: Arc<Mutex<Option<SessionUnmounter>>>,
+        _unmounter_slot: Arc<Mutex<Option<()>>>,
     ) -> Result<()> {
-        let mut options = vec![
-            MountOption::FSName("remoteFS".to_string()),
-            MountOption::AutoUnmount,
+        let mut options = Config::default();
+        options.acl = SessionACL::Owner;
+        options.mount_options = vec![
+            MountOption::FSName("FuserFS".to_string()),
         ];
 
         #[cfg(target_os = "linux")]
         {
-            options.push(MountOption::AllowOther);
-            options.push(MountOption::DefaultPermissions);
+            options.mount_options.push(MountOption::DefaultPermissions);
         }
 
         #[cfg(target_os = "macos")]
         {
-            options.push(MountOption::RW);
+            options.mount_options.push(MountOption::RW);
         }
 
         log::info!("Mounting filesystem at {}", mountpoint.display());
-
-        let mut session = Session::new(self, mountpoint, &options)
-            .map_err(|e| anyhow::anyhow!("Failed to create FUSE session: {e}"))?;
-
-        {
-            let mut guard = unmounter_slot.lock().unwrap();
-            *guard = Some(session.unmount_callable());
-        }
-
-        session
-            .run()
-            .map_err(|e| anyhow::anyhow!("FUSE session error: {e}"))?;
-
-        Ok(())
+        mount2(self, mountpoint, &options)
+            .map_err(|e| anyhow::anyhow!("FUSE session error: {e}"))
     }
 }
 
-impl Filesystem for RemoteFS {
+impl Filesystem for FuserFS {
     fn destroy(&mut self) {
+        let _guard = self.api_client.enter_runtime();
+
         if let Ok(mut cache) = self.cache.lock() {
             cache.clear();
         }
@@ -316,11 +313,13 @@ impl Filesystem for RemoteFS {
         }
     }
 
-    fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        let path = match self.inode_table.read().unwrap().child_path(parent, name) {
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        let _guard = self.api_client.enter_runtime();
+
+        let path = match self.inode_table.read().unwrap().child_path(parent.0, name) {
             Some(p) => p,
             None => {
-                reply.error(ENOENT);
+                reply.error(as_errno(ENOENT));
                 return;
             }
         };
@@ -331,15 +330,15 @@ impl Filesystem for RemoteFS {
                 && let Some(inode) = table.get(ino)
                 && !inode.is_metadata_expired()
             {
-                reply.entry(&FUSE_TTL, &inode.attr, 0);
+                reply.entry(&FUSE_TTL, &inode.attr, Generation(0));
                 return;
             }
         }
 
-        let parent_path = match self.inode_table.read().unwrap().get_cloned(parent) {
+        let parent_path = match self.inode_table.read().unwrap().get_cloned(parent.0) {
             Some(inode) => inode.path,
             None => {
-                reply.error(ENOENT);
+                reply.error(as_errno(ENOENT));
                 return;
             }
         };
@@ -348,7 +347,7 @@ impl Filesystem for RemoteFS {
             match cache.list_directory_cached(&parent_path, &self.api_client) {
                 Ok(entries) => entries,
                 Err(e) => {
-                    reply.error(e.errno);
+                    reply.error(as_errno(e.errno));
                     return;
                 }
             }
@@ -356,7 +355,7 @@ impl Filesystem for RemoteFS {
             match self.api_client.list_directory(&parent_path) {
                 Ok(entries) => entries,
                 Err(e) => {
-                    reply.error(e.errno);
+                    reply.error(as_errno(e.errno));
                     return;
                 }
             }
@@ -372,35 +371,37 @@ impl Filesystem for RemoteFS {
 
                 let ino = self.inode_table.write().unwrap().get_or_create(&full_path, &entry);
                 if let Some(inode) = self.inode_table.read().unwrap().get_cloned(ino) {
-                    reply.entry(&FUSE_TTL, &inode.attr, 0);
+                    reply.entry(&FUSE_TTL, &inode.attr, Generation(0));
                     return;
                 }
             }
         }
 
-        reply.error(ENOENT);
+        reply.error(as_errno(ENOENT));
     }
 
-    fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
-        if ino == 1
+    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        let _guard = self.api_client.enter_runtime();
+
+        if ino.0 == 1
             && let Ok(mut cache) = self.cache.lock()
         {
             cache.cleanup_expired();
         }
 
-        match self.inode_table.read().unwrap().get_cloned(ino) {
+        match self.inode_table.read().unwrap().get_cloned(ino.0) {
             Some(inode) => {
                 let _ = inode.ino;
                 reply.attr(&FUSE_TTL, &inode.attr)
             }
-            None => reply.error(ENOENT),
+            None => reply.error(as_errno(ENOENT)),
         }
     }
 
     fn setattr(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
         mode: Option<u32>,
         _uid: Option<u32>,
         _gid: Option<u32>,
@@ -408,17 +409,19 @@ impl Filesystem for RemoteFS {
         _atime: Option<fuser::TimeOrNow>,
         _mtime: Option<fuser::TimeOrNow>,
         _ctime: Option<SystemTime>,
-        _fh: Option<u64>,
+        _fh: Option<FileHandle>,
         _crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
-        _flags: Option<u32>,
+        _flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
-        let inode = match self.inode_table.read().unwrap().get_cloned(ino) {
+        let _guard = self.api_client.enter_runtime();
+
+        let inode = match self.inode_table.read().unwrap().get_cloned(ino.0) {
             Some(inode) => inode,
             None => {
-                reply.error(ENOENT);
+                reply.error(as_errno(ENOENT));
                 return;
             }
         };
@@ -433,12 +436,12 @@ impl Filesystem for RemoteFS {
             file_data.resize(new_size as usize, 0);
 
             if let Err(e) = self.api_client.write_file(&inode.path, &file_data) {
-                reply.error(e.errno);
+                reply.error(as_errno(e.errno));
                 return;
             }
 
             self.invalidate_all_for_path(&inode.path);
-            if let Some(node) = self.inode_table.write().unwrap().get_mut(ino) {
+            if let Some(node) = self.inode_table.write().unwrap().get_mut(ino.0) {
                 node.attr.size = new_size;
                 node.attr.mtime = SystemTime::now();
                 node.cached_at = Instant::now();
@@ -447,36 +450,38 @@ impl Filesystem for RemoteFS {
 
         if let Some(new_mode) = mode {
             if let Err(e) = self.api_client.set_attrs(&inode.path, Some(new_mode & 0o777)) {
-                reply.error(e.errno);
+                reply.error(as_errno(e.errno));
                 return;
             }
 
             self.invalidate_all_for_path(&inode.path);
-            if let Some(node) = self.inode_table.write().unwrap().get_mut(ino) {
+            if let Some(node) = self.inode_table.write().unwrap().get_mut(ino.0) {
                 node.attr.perm = (new_mode & 0o777) as u16;
                 node.attr.ctime = SystemTime::now();
                 node.cached_at = Instant::now();
             }
         }
 
-        match self.inode_table.read().unwrap().get_cloned(ino) {
+        match self.inode_table.read().unwrap().get_cloned(ino.0) {
             Some(inode) => reply.attr(&FUSE_TTL, &inode.attr),
-            None => reply.error(ENOENT),
+            None => reply.error(as_errno(ENOENT)),
         }
     }
 
     fn readdir(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        let inode = match self.inode_table.read().unwrap().get_cloned(ino) {
+        let _guard = self.api_client.enter_runtime();
+
+        let inode = match self.inode_table.read().unwrap().get_cloned(ino.0) {
             Some(inode) => inode,
             None => {
-                reply.error(ENOENT);
+                reply.error(as_errno(ENOENT));
                 return;
             }
         };
@@ -485,7 +490,7 @@ impl Filesystem for RemoteFS {
             match cache.list_directory_cached(&inode.path, &self.api_client) {
                 Ok(entries) => entries,
                 Err(e) => {
-                    reply.error(e.errno);
+                    reply.error(as_errno(e.errno));
                     return;
                 }
             }
@@ -493,7 +498,7 @@ impl Filesystem for RemoteFS {
             match self.api_client.list_directory(&inode.path) {
                 Ok(entries) => entries,
                 Err(e) => {
-                    reply.error(e.errno);
+                    reply.error(as_errno(e.errno));
                     return;
                 }
             }
@@ -501,7 +506,7 @@ impl Filesystem for RemoteFS {
 
         let mut i = offset;
         if i == 0 {
-            if reply.add(ino, i + 1, FileType::Directory, ".") {
+            if reply.add(INodeNo(ino.0), i + 1, FileType::Directory, ".") {
                 reply.ok();
                 return;
             }
@@ -509,7 +514,7 @@ impl Filesystem for RemoteFS {
         }
 
         if i == 1 {
-            if reply.add(ino, i + 1, FileType::Directory, "..") {
+            if reply.add(INodeNo(ino.0), i + 1, FileType::Directory, "..") {
                 reply.ok();
                 return;
             }
@@ -517,7 +522,7 @@ impl Filesystem for RemoteFS {
         }
 
         let mut table = self.inode_table.write().unwrap();
-        for entry in entries.iter().skip((i - 2).max(0) as usize) {
+        for entry in entries.iter().skip((i.saturating_sub(2)) as usize) {
             let full_path = if inode.path == "/" {
                 format!("/{}", entry.name)
             } else {
@@ -531,7 +536,7 @@ impl Filesystem for RemoteFS {
                 FileType::RegularFile
             };
 
-            if reply.add(entry_ino, i + 1, kind, &entry.name) {
+            if reply.add(INodeNo(entry_ino), i + 1, kind, &entry.name) {
                 break;
             }
             i += 1;
@@ -540,64 +545,80 @@ impl Filesystem for RemoteFS {
         reply.ok();
     }
 
-    fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: fuser::ReplyOpen) {
-        let _ = flags;
-        let path = match self.inode_table.read().unwrap().get_cloned(ino) {
+    fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        let _guard = self.api_client.enter_runtime();
+
+        let path = match self.inode_table.read().unwrap().get_cloned(ino.0) {
             Some(inode) => inode.path,
             None => {
-                reply.error(ENOENT);
+                reply.error(as_errno(ENOENT));
                 return;
             }
         };
 
         let fh = self.file_handles.lock().unwrap().open(path);
-        reply.opened(fh, 0);
+        reply.opened(FileHandle(fh), FopenFlags::empty());
     }
 
     fn release(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        fh: u64,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        self.file_handles.lock().unwrap().close(fh);
+        let _guard = self.api_client.enter_runtime();
+
+        self.file_handles.lock().unwrap().close(fh.0);
+        reply.ok();
+    }
+
+    fn flush(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _lock_owner: LockOwner,
+        reply: ReplyEmpty,
+    ) {
         reply.ok();
     }
 
     fn read(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
         size: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        let inode = match self.inode_table.read().unwrap().get_cloned(ino) {
+        let _guard = self.api_client.enter_runtime();
+
+        let inode = match self.inode_table.read().unwrap().get_cloned(ino.0) {
             Some(inode) => inode,
             None => {
-                reply.error(ENOENT);
+                reply.error(as_errno(ENOENT));
                 return;
             }
         };
 
-        if offset < 0 || offset as u64 >= inode.attr.size {
+        if offset >= inode.attr.size {
             reply.data(&[]);
             return;
         }
 
-        let offset_u64 = offset as u64;
+        let offset_u64 = offset;
         let data = if let Ok(mut cache) = self.cache.lock() {
             match cache.read_with_cache(&inode.path, offset_u64, size, &self.api_client) {
                 Ok(d) => d,
                 Err(e) => {
-                    reply.error(e.errno);
+                    reply.error(as_errno(e.errno));
                     return;
                 }
             }
@@ -605,7 +626,7 @@ impl Filesystem for RemoteFS {
             match self.api_client.read_file_chunk(&inode.path, offset_u64, size) {
                 Ok(d) => d,
                 Err(e) => {
-                    reply.error(e.errno);
+                    reply.error(as_errno(e.errno));
                     return;
                 }
             }
@@ -615,21 +636,23 @@ impl Filesystem for RemoteFS {
     }
 
     fn write(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
         data: &[u8],
-        _write_flags: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        _write_flags: WriteFlags,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
-        let inode = match self.inode_table.read().unwrap().get_cloned(ino) {
+        let _guard = self.api_client.enter_runtime();
+
+        let inode = match self.inode_table.read().unwrap().get_cloned(ino.0) {
             Some(inode) => inode,
             None => {
-                reply.error(ENOENT);
+                reply.error(as_errno(ENOENT));
                 return;
             }
         };
@@ -637,34 +660,36 @@ impl Filesystem for RemoteFS {
         let path_lock = self.path_locks.get_lock(&inode.path);
         let _guard = path_lock.lock().unwrap();
 
-        match self.api_client.write_file_chunk(&inode.path, offset as u64, data) {
+        match self.api_client.write_file_chunk(&inode.path, offset, data) {
             Ok(_) => {
                 self.invalidate_all_for_path(&inode.path);
-                if let Some(node) = self.inode_table.write().unwrap().get_mut(ino) {
-                    let new_size = ((offset as u64) + (data.len() as u64)).max(node.attr.size);
+                if let Some(node) = self.inode_table.write().unwrap().get_mut(ino.0) {
+                    let new_size = (offset + (data.len() as u64)).max(node.attr.size);
                     node.attr.size = new_size;
                     node.attr.mtime = SystemTime::now();
                     node.cached_at = Instant::now();
                 }
                 reply.written(data.len() as u32);
             }
-            Err(e) => reply.error(e.errno),
+            Err(e) => reply.error(as_errno(e.errno)),
         }
     }
 
     fn mkdir(
-        &mut self,
-        _req: &Request<'_>,
-        parent: u64,
+        &self,
+        _req: &Request,
+        parent: INodeNo,
         name: &OsStr,
         mode: u32,
         _umask: u32,
         reply: ReplyEntry,
     ) {
-        let path = match self.inode_table.read().unwrap().child_path(parent, name) {
+        let _guard = self.api_client.enter_runtime();
+
+        let path = match self.inode_table.read().unwrap().child_path(parent.0, name) {
             Some(p) => p,
             None => {
-                reply.error(ENOENT);
+                reply.error(as_errno(ENOENT));
                 return;
             }
         };
@@ -692,20 +717,22 @@ impl Filesystem for RemoteFS {
 
                 let ino = self.inode_table.write().unwrap().get_or_create(&path, &entry);
                 if let Some(inode) = self.inode_table.read().unwrap().get_cloned(ino) {
-                    reply.entry(&FUSE_TTL, &inode.attr, 0);
+                    reply.entry(&FUSE_TTL, &inode.attr, Generation(0));
                 } else {
-                    reply.error(libc::EIO);
+                    reply.error(as_errno(libc::EIO));
                 }
             }
-            Err(e) => reply.error(e.errno),
+            Err(e) => reply.error(as_errno(e.errno)),
         }
     }
 
-    fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        let path = match self.inode_table.read().unwrap().child_path(parent, name) {
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let _guard = self.api_client.enter_runtime();
+
+        let path = match self.inode_table.read().unwrap().child_path(parent.0, name) {
             Some(p) => p,
             None => {
-                reply.error(ENOENT);
+                reply.error(as_errno(ENOENT));
                 return;
             }
         };
@@ -719,37 +746,41 @@ impl Filesystem for RemoteFS {
                 self.inode_table.write().unwrap().remove_by_path(&path);
                 reply.ok();
             }
-            Err(e) => reply.error(e.errno),
+            Err(e) => reply.error(as_errno(e.errno)),
         }
     }
 
-    fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let _guard = self.api_client.enter_runtime();
+
         self.unlink(_req, parent, name, reply);
     }
 
     fn rename(
-        &mut self,
-        _req: &Request<'_>,
-        parent: u64,
+        &self,
+        _req: &Request,
+        parent: INodeNo,
         name: &OsStr,
-        newparent: u64,
+        newparent: INodeNo,
         newname: &OsStr,
-        _flags: u32,
+        _flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
+        let _guard = self.api_client.enter_runtime();
+
         let (from_path, to_path) = {
             let table = self.inode_table.read().unwrap();
-            let from = match table.child_path(parent, name) {
+            let from = match table.child_path(parent.0, name) {
                 Some(p) => p,
                 None => {
-                    reply.error(ENOENT);
+                    reply.error(as_errno(ENOENT));
                     return;
                 }
             };
-            let to = match table.child_path(newparent, newname) {
+            let to = match table.child_path(newparent.0, newname) {
                 Some(p) => p,
                 None => {
-                    reply.error(ENOENT);
+                    reply.error(as_errno(ENOENT));
                     return;
                 }
             };
@@ -786,24 +817,26 @@ impl Filesystem for RemoteFS {
                 self.inode_table.write().unwrap().rename(&from_path, &to_path);
                 reply.ok();
             }
-            Err(e) => reply.error(e.errno),
+            Err(e) => reply.error(as_errno(e.errno)),
         }
     }
 
     fn create(
-        &mut self,
-        _req: &Request<'_>,
-        parent: u64,
+        &self,
+        _req: &Request,
+        parent: INodeNo,
         name: &OsStr,
         mode: u32,
         _umask: u32,
         _flags: i32,
         reply: ReplyCreate,
     ) {
-        let path = match self.inode_table.read().unwrap().child_path(parent, name) {
+        let _guard = self.api_client.enter_runtime();
+
+        let path = match self.inode_table.read().unwrap().child_path(parent.0, name) {
             Some(p) => p,
             None => {
-                reply.error(ENOENT);
+                reply.error(as_errno(ENOENT));
                 return;
             }
         };
@@ -832,12 +865,34 @@ impl Filesystem for RemoteFS {
                 let ino = self.inode_table.write().unwrap().get_or_create(&path, &entry);
                 if let Some(inode) = self.inode_table.read().unwrap().get_cloned(ino) {
                     let fh = self.file_handles.lock().unwrap().open(path);
-                    reply.created(&FUSE_TTL, &inode.attr, 0, fh, 0);
+                    reply.created(
+                        &FUSE_TTL,
+                        &inode.attr,
+                        Generation(0),
+                        FileHandle(fh),
+                        FopenFlags::empty(),
+                    );
                 } else {
-                    reply.error(libc::EIO);
+                    reply.error(as_errno(libc::EIO));
                 }
             }
-            Err(e) => reply.error(e.errno),
+            Err(e) => reply.error(as_errno(e.errno)),
+        }
+    }
+
+    fn getxattr(&self, _req: &Request, _ino: INodeNo, _name: &OsStr, size: u32, reply: ReplyXattr) {
+        if size == 0 {
+            reply.size(0);
+        } else {
+            reply.data(&[]);
+        }
+    }
+
+    fn listxattr(&self, _req: &Request, _ino: INodeNo, size: u32, reply: ReplyXattr) {
+        if size == 0 {
+            reply.size(0);
+        } else {
+            reply.data(&[]);
         }
     }
 }
@@ -853,22 +908,53 @@ pub async fn run_fuser_client(api_client: ApiClient, mountpoint: String) -> Resu
     log::info!("Mounting filesystem...");
     log::info!("Use Ctrl+C or '{}' to unmount", unmount_hint);
 
-    let fs = RemoteFS::new(api_client);
-    let unmounter: Arc<Mutex<Option<SessionUnmounter>>> = Arc::new(Mutex::new(None));
-    let unmounter_for_signal = Arc::clone(&unmounter);
+    if mountpoint_path.exists() {
+        let md = std::fs::symlink_metadata(&mountpoint_path)
+            .with_context(|| format!("Failed to inspect mountpoint path: {}", mountpoint_path.display()))?;
 
-    tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok()
-            && let Ok(mut guard) = unmounter_for_signal.lock()
-            && let Some(ref mut u) = *guard
-        {
-            let _ = u.unmount();
+        if !md.is_dir() {
+            log::warn!(
+                "Mountpoint path exists but is not a directory, replacing it: {}",
+                mountpoint_path.display()
+            );
+
+            std::fs::remove_file(&mountpoint_path)
+                .with_context(|| format!("Failed to remove invalid mountpoint file: {}", mountpoint_path.display()))?;
+            std::fs::create_dir_all(&mountpoint_path)
+                .with_context(|| format!("Failed to create mountpoint directory: {}", mountpoint_path.display()))?;
         }
-    });
+    } else {
+        std::fs::create_dir_all(&mountpoint_path)
+            .with_context(|| format!("Failed to create mountpoint directory: {}", mountpoint_path.display()))?;
+    }
 
-    let unmounter_for_mount = Arc::clone(&unmounter);
+    #[cfg(target_os = "linux")]
+    {
+        let try_fusermount3 = Command::new("fusermount3")
+            .arg("-u")
+            .arg("-z")
+            .arg(&mountpoint)
+            .status();
+
+        if try_fusermount3.is_err() {
+            let _ = Command::new("fusermount")
+                .arg("-u")
+                .arg("-z")
+                .arg(&mountpoint)
+                .status();
+        }
+
+        let _ = Command::new("umount").arg("-l").arg(&mountpoint).status();
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = Command::new("umount").arg(&mountpoint).status();
+    }
+
+    let fs = FuserFS::new(api_client);
     tokio::task::spawn_blocking(move || {
-        fs.mount(&mountpoint_path, unmounter_for_mount)
+        fs.mount(&mountpoint_path, Arc::new(Mutex::new(None)))
             .context("Failed to mount filesystem")
     })
     .await

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tokio::{runtime::{EnterGuard, Handle}, task::block_in_place};
+use tokio::runtime::{EnterGuard, Handle};
 use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
