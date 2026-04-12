@@ -70,7 +70,7 @@ pub struct RemoteFilesystem {
 }
 
 impl RemoteFilesystem {
-    const READ_CHUNK_SIZE: usize = 8 * 1024 * 1024; // 8 MiB chunk for maximum speed
+    const READ_CHUNK_SIZE: usize = 1024 * 1024;
 
     fn endpoint_for_path(prefix: &str, path_clean: &str) -> String {
         if path_clean.is_empty() {
@@ -147,8 +147,8 @@ impl RemoteFilesystem {
         let url = Url::parse(server_url)?;
         
         let http_client = Client::builder()
-            //.timeout(Duration::from_secs(30))
-            .connect_timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(120)) 
             .tcp_keepalive(Duration::from_secs(60))
             .build()?;
         
@@ -304,46 +304,65 @@ impl RemoteFilesystem {
     }
 
     pub async fn read_file(&self, path: &str, offset: u64, size: u32) -> Result<Vec<u8>, i32> {
-        if !self.is_online.load(Ordering::SeqCst) {
+        // 1. Controllo se siamo online
+        if !self.is_online.load(Ordering::SeqCst) { 
             return Err(ENOTCONN); 
         }
 
         let path_clean = path.trim_start_matches('/');
         
+        // Se la richiesta è 0 byte, usciamo subito
         if size == 0 {
             return Ok(Vec::new());
         }
 
         let requested = size as usize;
-        
         let mut out = Vec::with_capacity(requested);
         let mut remaining = requested;
         let mut current_offset = offset;
 
         while remaining > 0 {
+            // Calcoliamo l'inizio del chunk (allineato a 1MB)
             let chunk_start = (current_offset / Self::READ_CHUNK_SIZE as u64) * Self::READ_CHUNK_SIZE as u64;
             let offset_in_chunk = (current_offset - chunk_start) as usize;
 
-            self.prefetch_next_chunk(path_clean.to_string(), chunk_start + Self::READ_CHUNK_SIZE as u64).await;
-            
+            // --- PIPELINING ---
+            // Lanciamo il prefetch del PROSSIMO chunk in background.
+            // Essendo una operazione 'spawned', non blocca questo loop.
+            let next_chunk_offset = chunk_start + Self::READ_CHUNK_SIZE as u64;
+            self.prefetch_next_chunk(path_clean.to_string(), next_chunk_offset).await;
+
+            // --- FETCH CORRENTE ---
+            // Ora recuperiamo il chunk che ci serve. Se il prefetch del ciclo precedente
+            // ha funzionato, lo troveremo già nella 'read_cache'.
             let chunk = match self.fetch_chunk(path_clean, chunk_start).await {
                 Ok(cached) => cached,
                 Err(_) => {
+                    // Se il sistema di chunking fallisce (es. errore di rete specifico),
+                    // proviamo un fallback diretto sul range richiesto per non bloccare l'utente.
+                    println!("[DEBUG] Chunk fetch failed, falling back to direct range request");
                     self.read_cache.invalidate_all();
                     return self.fetch_range(path_clean, offset, requested).await;
                 }
             };
 
+            // Controllo di sicurezza sui limiti del chunk ricevuto
             if offset_in_chunk >= chunk.len() {
                 break;
             }
 
-            let to_take = min(remaining, chunk.len() - offset_in_chunk);
+            // Calcoliamo quanto possiamo prendere da questo chunk
+            let avail = chunk.len() - offset_in_chunk;
+            let to_take = min(remaining, avail);
+
+            // Copiamo i dati nel buffer di uscita
             out.extend_from_slice(&chunk[offset_in_chunk..offset_in_chunk + to_take]);
 
+            // Aggiorniamo i puntatori
             remaining -= to_take;
             current_offset += to_take as u64;
 
+            // Se il chunk ricevuto è più piccolo dello standard, significa che il file è finito
             if chunk.len() < Self::READ_CHUNK_SIZE {
                 break;
             }
