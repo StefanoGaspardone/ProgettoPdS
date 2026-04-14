@@ -60,11 +60,14 @@ fn stop_daemon() -> Result<()> {
         let rc = unsafe { libc::kill(pid as i32, libc::SIGINT) };
         if rc != 0 {
             let err = std::io::Error::last_os_error();
+            
             if err.raw_os_error() == Some(libc::ESRCH) {
                 remove_pid_file();
-                println!("No running daemon found (stale pid file removed)");
+                
+                log::warn!("No running daemon found (stale pid file removed)");
                 return Ok(());
             }
+            
             return Err(anyhow::anyhow!("Failed to signal daemon pid {}: {}", pid, err));
         }
     }
@@ -118,6 +121,7 @@ fn spawn_daemon_child() -> Result<()> {
                 if libc::setsid() == -1 {
                     return Err(std::io::Error::last_os_error());
                 }
+
                 Ok(())
             });
         }
@@ -125,6 +129,7 @@ fn spawn_daemon_child() -> Result<()> {
 
     let child = cmd.spawn().context("Failed to spawn daemon child process")?;
     write_pid_file(child.id())?;
+    
     println!("Client daemon started with pid {}", child.id());
     Ok(())
 }
