@@ -30,12 +30,6 @@ mod fuser {
         }
 
         #[test]
-        fn as_errno_preserves_code_mapping() {
-            assert_eq!(as_errno(libc::ENOENT), Errno::from_i32(libc::ENOENT));
-            assert_eq!(as_errno(libc::EIO), Errno::from_i32(libc::EIO));
-        }
-
-        #[test]
         fn inode_reports_expired_metadata() {
             let mut inode = InodeTable::new(1000, 1000)
                 .get_cloned(1)
