@@ -19,6 +19,45 @@ use crate::cache::{CacheManager, METADATA_CACHE_TTL};
 
 const FUSE_TTL: Duration = Duration::from_secs(1);
 
+#[cfg(target_os = "linux")]
+fn parse_env_usize_with_bounds(name: &str, default: usize, min: usize, max: usize) -> usize {
+    match std::env::var(name) {
+        Ok(raw) => match raw.trim().parse::<usize>() {
+            Ok(value) if value >= min && value <= max => value,
+            Ok(value) => {
+                let clamped = value.clamp(min, max);
+                log::warn!(
+                    "{}={} out of range; clamped to {}",
+                    name,
+                    value,
+                    clamped
+                );
+                clamped
+            }
+            Err(_) => {
+                log::warn!("Invalid {}='{}'; using default {}", name, raw, default);
+                default
+            }
+        },
+        Err(_) => default,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn parse_env_bool(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            _ => {
+                log::warn!("Invalid {}='{}'; using default {}", name, raw, default);
+                default
+            }
+        },
+        Err(_) => default,
+    }
+}
+
 fn as_errno(code: i32) -> Errno {
     Errno::from_i32(code)
 }
@@ -118,7 +157,7 @@ impl InodeTable {
         let attr = FileAttr {
             ino: INodeNo(ino),
             size: entry.size,
-            blocks: entry.size.div_ceil(512),
+            blocks: (entry.size + 511) / 512,
             atime: UNIX_EPOCH + Duration::from_secs_f64(entry.mtime),
             mtime: UNIX_EPOCH + Duration::from_secs_f64(entry.mtime),
             ctime: UNIX_EPOCH + Duration::from_secs_f64(entry.ctime),
@@ -134,7 +173,7 @@ impl InodeTable {
             gid: self.gid,
             rdev: 0,
             flags: 0,
-            blksize: 512,
+            blksize: 4096,
         };
 
         self.inodes.insert(
@@ -283,6 +322,26 @@ impl FuserFS {
         #[cfg(target_os = "linux")]
         {
             options.mount_options.push(MountOption::DefaultPermissions);
+
+            let default_threads = std::thread::available_parallelism()
+                .map(|n| n.get().clamp(2, 8))
+                .unwrap_or(4);
+            let worker_threads = parse_env_usize_with_bounds(
+                "REMOTEFS_FUSE_THREADS",
+                default_threads,
+                1,
+                32,
+            );
+            let clone_fd = parse_env_bool("REMOTEFS_FUSE_CLONE_FD", true);
+
+            options.n_threads = Some(worker_threads);
+            options.clone_fd = clone_fd;
+
+            log::info!(
+                "FUSE Linux tuning enabled: n_threads={} clone_fd={}",
+                worker_threads,
+                options.clone_fd
+            );
         }
 
         #[cfg(target_os = "macos")]
@@ -563,7 +622,7 @@ impl Filesystem for FuserFS {
         reply: ReplyData,
     ) {
         let _guard = self.api_client.enter_runtime();
-        log::info!("[FUSE] read ino={} offset={} size={}", ino.0, offset, size);
+        log::debug!("[FUSE] read ino={} offset={} size={}", ino.0, offset, size);
 
         let inode = match self.inode_table.read().unwrap().get_cloned(ino.0) {
             Some(inode) => inode,
@@ -574,10 +633,10 @@ impl Filesystem for FuserFS {
             }
         };
 
-        log::info!("[FUSE] read path={} file_size={}", inode.path, inode.attr.size);
+        log::debug!("[FUSE] read path={} file_size={}", inode.path, inode.attr.size);
 
         if offset >= inode.attr.size {
-            log::info!("[FUSE] read EOF path={} offset={} size={}", inode.path, offset, size);
+            log::debug!("[FUSE] read EOF path={} offset={} size={}", inode.path, offset, size);
             reply.data(&[]);
             return;
         }
@@ -617,7 +676,7 @@ impl Filesystem for FuserFS {
             }
         };
 
-        log::info!("[FUSE] read ok path={} requested={} returned={}", inode.path, size, data.len());
+        log::debug!("[FUSE] read ok path={} requested={} returned={}", inode.path, size, data.len());
         reply.data(&data);
     }
 

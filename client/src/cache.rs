@@ -1,12 +1,85 @@
 use std::collections::HashMap;
+use std::env;
 use std::time::{Duration, Instant, SystemTime};
 use crate::apis::{ApiClient, ApiError, FileEntry};
 
-pub const CHUNK_SIZE: u32 = 128 * 1024;
+pub const CHUNK_SIZE: u32 = 1024 * 1024;
 const MAX_CACHE_SIZE: usize = 10 * 1024 * 1024;
+const MIN_CHUNK_SIZE: u32 = 64 * 1024;
+const MAX_CHUNK_SIZE: u32 = 8 * 1024 * 1024;
+const MIN_CACHE_SIZE: usize = 4 * 1024 * 1024;
+const MAX_CACHE_SIZE_LIMIT: usize = 1024 * 1024 * 1024;
 pub const METADATA_CACHE_TTL: Duration = Duration::from_secs(5);
 pub const DIRECTORY_CACHE_TTL: Duration = Duration::from_secs(3);
 pub const DATA_CACHE_TTL: Duration = Duration::from_secs(10);
+
+fn configured_chunk_size() -> u32 {
+    const ENV_VAR: &str = "REMOTEFS_CHUNK_SIZE_KB";
+
+    match env::var(ENV_VAR) {
+        Ok(raw) => match raw.trim().parse::<u32>() {
+            Ok(kb) if kb > 0 => {
+                let requested = kb.saturating_mul(1024);
+                let effective = requested.clamp(MIN_CHUNK_SIZE, MAX_CHUNK_SIZE);
+
+                if requested != effective {
+                    log::warn!(
+                        "{}={} out of range; clamped to {} KiB",
+                        ENV_VAR,
+                        kb,
+                        effective / 1024
+                    );
+                }
+
+                effective
+            }
+            _ => {
+                log::warn!(
+                    "Invalid {}='{}'; using default {} KiB",
+                    ENV_VAR,
+                    raw,
+                    CHUNK_SIZE / 1024
+                );
+                CHUNK_SIZE
+            }
+        },
+        Err(_) => CHUNK_SIZE,
+    }
+}
+
+fn configured_max_cache_size() -> usize {
+    const ENV_VAR: &str = "REMOTEFS_CACHE_SIZE_MB";
+
+    match env::var(ENV_VAR) {
+        Ok(raw) => match raw.trim().parse::<usize>() {
+            Ok(mb) if mb > 0 => {
+                let requested = mb.saturating_mul(1024 * 1024);
+                let effective = requested.clamp(MIN_CACHE_SIZE, MAX_CACHE_SIZE_LIMIT);
+
+                if requested != effective {
+                    log::warn!(
+                        "{}={} out of range; clamped to {} MiB",
+                        ENV_VAR,
+                        mb,
+                        effective / (1024 * 1024)
+                    );
+                }
+
+                effective
+            }
+            _ => {
+                log::warn!(
+                    "Invalid {}='{}'; using default {} MiB",
+                    ENV_VAR,
+                    raw,
+                    MAX_CACHE_SIZE / (1024 * 1024)
+                );
+                MAX_CACHE_SIZE
+            }
+        },
+        Err(_) => MAX_CACHE_SIZE,
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct CachedEntry<T> {
@@ -56,13 +129,26 @@ pub struct DirectoryCache {
 pub struct CacheManager {
     file_cache: HashMap<String, FileCache>,
     directory_cache: HashMap<String, DirectoryCache>,
+    chunk_size: u32,
+    max_cache_size: usize,
 }
 
 impl CacheManager {
     pub fn new() -> Self {
+        let chunk_size = configured_chunk_size();
+        let max_cache_size = configured_max_cache_size();
+
+        log::info!(
+            "Cache tuning: chunk_size={} KiB max_cache={} MiB",
+            chunk_size / 1024,
+            max_cache_size / (1024 * 1024)
+        );
+
         Self {
             file_cache: HashMap::new(),
             directory_cache: HashMap::new(),
+            chunk_size,
+            max_cache_size,
         }
     }
 
@@ -107,7 +193,8 @@ impl CacheManager {
     }
 
     pub fn read_from_cache(&mut self, path: &str, offset: u64, size: u32) -> Option<Vec<u8>> {
-        let chunk_start = (offset / CHUNK_SIZE as u64) * CHUNK_SIZE as u64;
+        let chunk_size = self.chunk_size as u64;
+        let chunk_start = (offset / chunk_size) * chunk_size;
 
         if let Some(file_cache) = self.file_cache.get_mut(path) {
             if let Some(cached_chunk) = file_cache.chunks.get_mut(&chunk_start) {
@@ -134,19 +221,54 @@ impl CacheManager {
     }
 
     pub fn read_with_cache(&mut self, path: &str, offset: u64, size: u32, api_client: &ApiClient) -> Result<Vec<u8>, ApiError> {
-        let chunk_start = (offset / CHUNK_SIZE as u64) * CHUNK_SIZE as u64;
-
-        if let Some(data) = self.read_from_cache(path, offset, size) {
-            return Ok(data);
+        if size == 0 {
+            return Ok(Vec::new());
         }
 
-        let chunk_data = api_client.read_file_chunk(path, chunk_start, CHUNK_SIZE)?;
-        self.store_file_chunk(path, chunk_start, chunk_data.clone());
+        let chunk_size = self.chunk_size;
+        let mut remaining = size as usize;
+        let mut current_offset = offset;
+        let mut result = Vec::with_capacity(size as usize);
 
-        let chunk_offset = (offset - chunk_start) as usize;
-        let chunk_end = (chunk_offset + size as usize).min(chunk_data.len());
-        
-        Ok(chunk_data[chunk_offset..chunk_end].to_vec())
+        while remaining > 0 {
+            let chunk_start = (current_offset / chunk_size as u64) * chunk_size as u64;
+            let chunk_offset = (current_offset - chunk_start) as usize;
+            let needed_from_chunk = (chunk_size as usize - chunk_offset).min(remaining);
+
+            let chunk_data = if let Some(data) = self.read_from_cache(path, current_offset, needed_from_chunk as u32) {
+                data
+            } else {
+                let data = api_client.read_file_chunk(path, chunk_start, chunk_size)?;
+
+                if data.is_empty() {
+                    break;
+                }
+
+                if chunk_offset >= data.len() {
+                    break;
+                }
+
+                let end = (chunk_offset + needed_from_chunk).min(data.len());
+                let sliced = data[chunk_offset..end].to_vec();
+                self.store_file_chunk(path, chunk_start, data);
+                sliced
+            };
+
+            if chunk_data.is_empty() {
+                break;
+            }
+
+            let read_len = chunk_data.len();
+            result.extend_from_slice(&chunk_data);
+            current_offset += read_len as u64;
+            remaining = remaining.saturating_sub(read_len);
+
+            if read_len < needed_from_chunk {
+                break;
+            }
+        }
+
+        Ok(result)
     }
 
     fn store_chunk(&mut self, path: &str, offset: u64, data: Vec<u8>) {
@@ -171,7 +293,7 @@ impl CacheManager {
             }
         }
 
-        while file_cache.total_size + data.len() > MAX_CACHE_SIZE && !file_cache.chunks.is_empty() {
+        while file_cache.total_size + data.len() > self.max_cache_size && !file_cache.chunks.is_empty() {
             if let Some((&oldest_offset, _)) = file_cache
                 .chunks
                 .iter()

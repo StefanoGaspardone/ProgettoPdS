@@ -132,6 +132,39 @@ cd client
 cargo run
 ```
 
+### Tuning Performance via Variabili d'Ambiente (Client)
+
+Puoi migliorare la velocita di lettura senza ricompilare impostando queste variabili:
+
+- `REMOTEFS_CHUNK_SIZE_KB`: dimensione chunk HTTP per la lettura file.
+  Default: `1024` (1 MiB). Range supportato: `64..8192`.
+- `REMOTEFS_CACHE_SIZE_MB`: cache dati massima lato client.
+  Default: `10` MiB. Range supportato: `4..1024`.
+- `REMOTEFS_FUSE_THREADS` (Linux): numero worker thread FUSE.
+  Default: auto (`2..8` in base alla CPU). Range supportato: `1..32`.
+- `REMOTEFS_FUSE_CLONE_FD` (Linux): abilita fd clonati per worker FUSE.
+  Default: `true`. Valori: `true/false`, `1/0`, `yes/no`, `on/off`.
+
+Esempio:
+
+```bash
+cd client
+export REMOTEFS_CHUNK_SIZE_KB=2048
+export REMOTEFS_CACHE_SIZE_MB=64
+export REMOTEFS_FUSE_THREADS=8
+export REMOTEFS_FUSE_CLONE_FD=true
+cargo run -- --daemon
+```
+
+Oppure nel file `client/.env`:
+
+```env
+REMOTEFS_CHUNK_SIZE_KB=2048
+REMOTEFS_CACHE_SIZE_MB=64
+REMOTEFS_FUSE_THREADS=8
+REMOTEFS_FUSE_CLONE_FD=true
+```
+
 Al primo avvio, Cargo scaricherà e compilerà tutte le dipendenze Rust.
 
 ---

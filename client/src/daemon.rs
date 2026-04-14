@@ -18,6 +18,7 @@ pub fn write_pid_file_to(path: &Path, pid: u32) -> Result<()> {
     fs::write(path, pid.to_string()).context("Failed to write pid file")
 }
 
+#[cfg(test)]
 pub fn read_pid_file_from(path: &Path) -> Result<u32> {
     let pid_raw = fs::read_to_string(path).context("Daemon pid file not found")?;
     let pid = pid_raw
@@ -36,6 +37,7 @@ pub fn write_pid_file(pid: u32) -> Result<()> {
     write_pid_file_to(&pid_file_path(), pid)
 }
 
+#[cfg(test)]
 pub fn read_pid_file() -> Result<u32> {
     read_pid_file_from(&pid_file_path())
 }
@@ -57,6 +59,7 @@ pub fn read_pid_file_optional_from(path: &Path) -> Result<Option<u32>> {
     }
 }
 
+#[cfg(test)]
 pub fn read_pid_file_optional() -> Result<Option<u32>> {
     read_pid_file_optional_from(&pid_file_path())
 }

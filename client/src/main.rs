@@ -153,6 +153,17 @@ fn main() -> Result<()> {
     info!("Server: {}", server_address);
     info!("Mount point: {}", mount_point);
 
+    for key in [
+        "REMOTEFS_CHUNK_SIZE_KB",
+        "REMOTEFS_CACHE_SIZE_MB",
+        "REMOTEFS_FUSE_THREADS",
+        "REMOTEFS_FUSE_CLONE_FD",
+    ] {
+        if let Ok(value) = env::var(key) {
+            info!("{}={}", key, value);
+        }
+    }
+
     #[cfg(target_os = "windows")]
     {
         let mount_for_signal = mount_point.clone();

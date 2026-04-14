@@ -250,6 +250,59 @@ mod cache {
         }
 
         #[test]
+        fn read_with_cache_spanning_chunks_stitches_full_response() {
+            let server = MockServer::start();
+            let first_chunk: Vec<u8> = (0..CHUNK_SIZE as usize)
+                .map(|i| (i % 251) as u8)
+                .collect();
+            let second_chunk: Vec<u8> = (0..CHUNK_SIZE as usize)
+                .map(|i| ((i + 17) % 251) as u8)
+                .collect();
+
+            let first_mock = server.mock(|when, then| {
+                when.method(GET)
+                    .path("/files/blob")
+                    .query_param("offset", "0")
+                    .query_param("size", &CHUNK_SIZE.to_string());
+                then.status(200).body(first_chunk.clone());
+            });
+
+            let second_mock = server.mock(|when, then| {
+                when.method(GET)
+                    .path("/files/blob")
+                    .query_param("offset", &CHUNK_SIZE.to_string())
+                    .query_param("size", &CHUNK_SIZE.to_string());
+                then.status(200).body(second_chunk.clone());
+            });
+
+            let (_rt, api) = make_client(server.base_url());
+            let _guard = api.enter_runtime();
+            let mut manager = CacheManager::new();
+
+            let warmup = manager
+                .read_with_cache("/blob", 0, CHUNK_SIZE, &api)
+                .expect("initial read should fetch first chunk");
+            assert_eq!(warmup.len(), CHUNK_SIZE as usize);
+
+            let overlap = 4096usize;
+            let start = CHUNK_SIZE as u64 - overlap as u64;
+            let requested = (overlap * 2) as u32;
+
+            let stitched = manager
+                .read_with_cache("/blob", start, requested, &api)
+                .expect("spanning read should stitch data across chunks");
+
+            let mut expected = Vec::with_capacity(requested as usize);
+            expected.extend_from_slice(&first_chunk[first_chunk.len() - overlap..]);
+            expected.extend_from_slice(&second_chunk[..overlap]);
+
+            assert_eq!(stitched.len(), requested as usize);
+            assert_eq!(stitched, expected);
+            first_mock.assert_hits(1);
+            second_mock.assert_hits(1);
+        }
+
+        #[test]
         fn invalidate_all_for_path_clears_file_and_parent_directory_cache() {
             let mut manager = CacheManager::new();
             manager.store_file_chunk("/root/file.txt", 0, vec![1, 2]);

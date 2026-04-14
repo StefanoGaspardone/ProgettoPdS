@@ -121,7 +121,7 @@ impl ApiClient {
             size
         );
 
-        log::info!("[API] read_file_chunk path={} offset={} size={}", path, offset, size);
+        log::debug!("[API] read_file_chunk path={} offset={} size={}", path, offset, size);
 
         let response = self.block_on(self.client.get(&url).send())
             .map_err(|e| ApiError::from_network_error("read_file_chunk", &e))?;
@@ -141,7 +141,7 @@ impl ApiClient {
             bytes.to_vec()
         };
 
-        log::info!("[API] read_file_chunk ok path={} offset={} requested={} returned={}", path, offset, size, result.len());
+        log::debug!("[API] read_file_chunk ok path={} offset={} requested={} returned={}", path, offset, size, result.len());
         Ok(result)
     }
 
