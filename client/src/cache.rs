@@ -86,17 +86,14 @@ impl CacheManager {
         );
     }
 
-    pub fn list_directory_cached(
-        &mut self,
-        path: &str,
-        api_client: &ApiClient,
-    ) -> Result<Vec<FileEntry>, ApiError> {
+    pub fn list_directory_cached(&mut self, path: &str, api_client: &ApiClient) -> Result<Vec<FileEntry>, ApiError> {
         if let Some(entries) = self.get_cached_directory(path) {
             return Ok(entries);
         }
 
         let entries = api_client.list_directory(path)?;
         self.store_directory_listing(path, entries.clone());
+        
         Ok(entries)
     }
 
@@ -116,8 +113,10 @@ impl CacheManager {
             if let Some(cached_chunk) = file_cache.chunks.get_mut(&chunk_start) {
                 if !cached_chunk.is_expired() {
                     cached_chunk.last_access = SystemTime::now();
+                    
                     let chunk_offset = (offset - chunk_start) as usize;
                     let chunk_end = (chunk_offset + size as usize).min(cached_chunk.data.len());
+                    
                     return Some(cached_chunk.data[chunk_offset..chunk_end].to_vec());
                 }
 
@@ -134,13 +133,7 @@ impl CacheManager {
         self.store_chunk(path, offset, data);
     }
 
-    pub fn read_with_cache(
-        &mut self,
-        path: &str,
-        offset: u64,
-        size: u32,
-        api_client: &ApiClient,
-    ) -> Result<Vec<u8>, ApiError> {
+    pub fn read_with_cache(&mut self, path: &str, offset: u64, size: u32, api_client: &ApiClient) -> Result<Vec<u8>, ApiError> {
         let chunk_start = (offset / CHUNK_SIZE as u64) * CHUNK_SIZE as u64;
 
         if let Some(data) = self.read_from_cache(path, offset, size) {
@@ -152,6 +145,7 @@ impl CacheManager {
 
         let chunk_offset = (offset - chunk_start) as usize;
         let chunk_end = (chunk_offset + size as usize).min(chunk_data.len());
+        
         Ok(chunk_data[chunk_offset..chunk_end].to_vec())
     }
 
@@ -181,8 +175,7 @@ impl CacheManager {
             if let Some((&oldest_offset, _)) = file_cache
                 .chunks
                 .iter()
-                .min_by_key(|(_, chunk)| chunk.last_access)
-            {
+                .min_by_key(|(_, chunk)| chunk.last_access) {
                 if let Some(removed) = file_cache.chunks.remove(&oldest_offset) {
                     file_cache.total_size = file_cache.total_size.saturating_sub(removed.data.len());
                 }
@@ -224,16 +217,18 @@ impl CacheManager {
             let mut reclaimed = 0usize;
             file_cache.chunks.retain(|_, chunk| {
                 let keep = !chunk.is_expired();
+                
                 if !keep {
                     reclaimed += chunk.data.len();
                 }
+                
                 keep
             });
+            
             file_cache.total_size = file_cache.total_size.saturating_sub(reclaimed);
         }
 
-        self.file_cache
-            .retain(|_, file_cache| !file_cache.chunks.is_empty());
+        self.file_cache.retain(|_, file_cache| !file_cache.chunks.is_empty());
     }
 
     pub fn clear(&mut self) {

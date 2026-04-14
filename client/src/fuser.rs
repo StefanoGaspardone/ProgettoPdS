@@ -95,6 +95,7 @@ impl InodeTable {
                 inode.attr.ctime = UNIX_EPOCH + Duration::from_secs_f64(entry.ctime);
                 inode.cached_at = Instant::now();
             }
+            
             return ino;
         }
 
@@ -146,6 +147,7 @@ impl InodeTable {
             },
         );
         self.path_to_ino.insert(path.to_string(), ino);
+        
         ino
     }
 
@@ -181,6 +183,7 @@ impl InodeTable {
     fn rename(&mut self, from: &str, to: &str) {
         if let Some(ino) = self.path_to_ino.remove(from) {
             self.path_to_ino.insert(to.to_string(), ino);
+            
             if let Some(inode) = self.inodes.get_mut(&ino) {
                 inode.path = to.to_string();
                 inode.cached_at = Instant::now();
@@ -189,9 +192,7 @@ impl InodeTable {
     }
 
     fn invalidate_metadata(&mut self, path: &str) {
-        if let Some(&ino) = self.path_to_ino.get(path)
-            && let Some(inode) = self.inodes.get_mut(&ino)
-        {
+        if let Some(&ino) = self.path_to_ino.get(path) && let Some(inode) = self.inodes.get_mut(&ino) {
             inode.cached_at = Instant::now() - METADATA_CACHE_TTL - Duration::from_secs(1);
         }
     }
@@ -212,8 +213,10 @@ impl FileHandleTable {
 
     fn open(&mut self, path: String) -> u64 {
         let fh = self.next_fh;
+        
         self.next_fh += 1;
         self.handles.insert(fh, path);
+        
         fh
     }
 
@@ -269,12 +272,9 @@ impl FuserFS {
         self.inode_table.write().unwrap().invalidate_metadata(path);
     }
 
-    pub fn mount(
-        self,
-        mountpoint: &Path,
-        _unmounter_slot: Arc<Mutex<Option<()>>>,
-    ) -> Result<()> {
+    pub fn mount(self, mountpoint: &Path, _unmounter_slot: Arc<Mutex<Option<()>>>) -> Result<()> {
         let mut options = Config::default();
+        
         options.acl = SessionACL::Owner;
         options.mount_options = vec![
             MountOption::FSName("FuserFS".to_string()),
@@ -291,6 +291,7 @@ impl FuserFS {
         }
 
         log::info!("Mounting filesystem at {}", mountpoint.display());
+        
         mount2(self, mountpoint, &options)
             .map_err(|e| anyhow::anyhow!("FUSE session error: {e}"))
     }
@@ -303,10 +304,12 @@ impl Filesystem for FuserFS {
         if let Ok(mut cache) = self.cache.lock() {
             cache.clear();
         }
+        
         if let Ok(mut handles) = self.file_handles.lock() {
             handles.handles.clear();
             handles.next_fh = 1;
         }
+        
         if let Ok(mut table) = self.inode_table.write() {
             table.inodes.clear();
             table.path_to_ino.clear();
@@ -328,10 +331,7 @@ impl Filesystem for FuserFS {
 
         {
             let table = self.inode_table.read().unwrap();
-            if let Some(&ino) = table.path_to_ino.get(&path)
-                && let Some(inode) = table.get(ino)
-                && !inode.is_metadata_expired()
-            {
+            if let Some(&ino) = table.path_to_ino.get(&path) && let Some(inode) = table.get(ino) && !inode.is_metadata_expired() {
                 reply.entry(&FUSE_TTL, &inode.attr, Generation(0));
                 return;
             }
@@ -386,9 +386,7 @@ impl Filesystem for FuserFS {
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
         let _guard = self.api_client.enter_runtime();
 
-        if ino.0 == 1
-            && let Ok(mut cache) = self.cache.lock()
-        {
+        if ino.0 == 1 && let Ok(mut cache) = self.cache.lock() {
             cache.cleanup_expired();
         }
 
@@ -401,24 +399,7 @@ impl Filesystem for FuserFS {
         }
     }
 
-    fn setattr(
-        &self,
-        _req: &Request,
-        ino: INodeNo,
-        mode: Option<u32>,
-        _uid: Option<u32>,
-        _gid: Option<u32>,
-        size: Option<u64>,
-        _atime: Option<fuser::TimeOrNow>,
-        _mtime: Option<fuser::TimeOrNow>,
-        _ctime: Option<SystemTime>,
-        _fh: Option<FileHandle>,
-        _crtime: Option<SystemTime>,
-        _chgtime: Option<SystemTime>,
-        _bkuptime: Option<SystemTime>,
-        _flags: Option<BsdFileFlags>,
-        reply: ReplyAttr,
-    ) {
+    fn setattr(&self, _req: &Request, ino: INodeNo, mode: Option<u32>, _uid: Option<u32>, _gid: Option<u32>, size: Option<u64>, _atime: Option<fuser::TimeOrNow>, _mtime: Option<fuser::TimeOrNow>, _ctime: Option<SystemTime>, _fh: Option<FileHandle>, _crtime: Option<SystemTime>, _chgtime: Option<SystemTime>, _bkuptime: Option<SystemTime>, _flags: Option<BsdFileFlags>, reply: ReplyAttr) {
         let _guard = self.api_client.enter_runtime();
 
         let inode = match self.inode_table.read().unwrap().get_cloned(ino.0) {
@@ -432,9 +413,7 @@ impl Filesystem for FuserFS {
         let path_lock = self.path_locks.get_lock(&inode.path);
         let _guard = path_lock.lock().unwrap();
 
-        if let Some(new_size) = size
-            && inode.attr.kind == FileType::RegularFile
-        {
+        if let Some(new_size) = size && inode.attr.kind == FileType::RegularFile {
             let mut file_data = self.api_client.read_file(&inode.path).unwrap_or_default();
             file_data.resize(new_size as usize, 0);
 
@@ -471,14 +450,7 @@ impl Filesystem for FuserFS {
         }
     }
 
-    fn readdir(
-        &self,
-        _req: &Request,
-        ino: INodeNo,
-        _fh: FileHandle,
-        offset: u64,
-        mut reply: ReplyDirectory,
-    ) {
+    fn readdir(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64, mut reply: ReplyDirectory) {
         let _guard = self.api_client.enter_runtime();
 
         let inode = match self.inode_table.read().unwrap().get_cloned(ino.0) {
@@ -542,6 +514,7 @@ impl Filesystem for FuserFS {
             if reply.add(INodeNo(entry_ino), i + 1, kind, &entry.name) {
                 break;
             }
+            
             i += 1;
         }
 
@@ -565,16 +538,7 @@ impl Filesystem for FuserFS {
         reply.opened(FileHandle(fh), FopenFlags::empty());
     }
 
-    fn release(
-        &self,
-        _req: &Request,
-        _ino: INodeNo,
-        fh: FileHandle,
-        _flags: OpenFlags,
-        _lock_owner: Option<LockOwner>,
-        _flush: bool,
-        reply: ReplyEmpty,
-    ) {
+    fn release(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, _flags: OpenFlags, _lock_owner: Option<LockOwner>, _flush: bool, reply: ReplyEmpty) {
         let _guard = self.api_client.enter_runtime();
         log::info!("[FUSE] release fh={}", fh.0);
 
@@ -582,14 +546,7 @@ impl Filesystem for FuserFS {
         reply.ok();
     }
 
-    fn flush(
-        &self,
-        _req: &Request,
-        ino: INodeNo,
-        fh: FileHandle,
-        lock_owner: LockOwner,
-        reply: ReplyEmpty,
-    ) {
+    fn flush(&self, _req: &Request, ino: INodeNo, fh: FileHandle, lock_owner: LockOwner, reply: ReplyEmpty) {
         log::info!("[FUSE] flush ino={} fh={} lock_owner={:?}", ino.0, fh.0, lock_owner);
         reply.ok();
     }
@@ -698,6 +655,7 @@ impl Filesystem for FuserFS {
                     node.attr.mtime = SystemTime::now();
                     node.cached_at = Instant::now();
                 }
+                
                 reply.written(data.len() as u32);
             }
             Err(e) => reply.error(as_errno(e.errno)),
@@ -773,6 +731,7 @@ impl Filesystem for FuserFS {
             Ok(_) => {
                 self.invalidate_all_for_path(&path);
                 self.inode_table.write().unwrap().remove_by_path(&path);
+                
                 reply.ok();
             }
             Err(e) => reply.error(as_errno(e.errno)),
@@ -806,6 +765,7 @@ impl Filesystem for FuserFS {
                     return;
                 }
             };
+            
             let to = match table.child_path(newparent.0, newname) {
                 Some(p) => p,
                 None => {
@@ -813,6 +773,7 @@ impl Filesystem for FuserFS {
                     return;
                 }
             };
+            
             (from, to)
         };
 
@@ -834,16 +795,20 @@ impl Filesystem for FuserFS {
         match self.api_client.rename(&from_path, &to_path) {
             Ok(_) => {
                 self.invalidate_all_for_path(&from_path);
+                
                 if let Some((parent_path, _)) = to_path.rsplit_once('/') {
                     let to_parent = if parent_path.is_empty() {
                         "/"
                     } else {
                         parent_path
                     };
+                    
                     self.cache.lock().unwrap().invalidate_directory_cache(to_parent);
                 }
+                
                 self.invalidate_all_for_path(&to_path);
                 self.inode_table.write().unwrap().rename(&from_path, &to_path);
+                
                 reply.ok();
             }
             Err(e) => reply.error(as_errno(e.errno)),

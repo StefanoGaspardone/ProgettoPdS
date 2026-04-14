@@ -5,14 +5,14 @@ mod fuser;
 mod dokany;
 
 mod apis;
+mod daemon;
 
 use anyhow::{Context, Result};
 use crate::apis::ApiClient;
+use crate::daemon::{ARG_DAEMON, ARG_FOREGROUND};
 use dotenvy::dotenv;
 use log::info;
 use std::env;
-use std::fs;
-use std::path::PathBuf;
 use std::process::Stdio;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::process::{self, Command};
@@ -23,37 +23,14 @@ use std::os::windows::process::CommandExt;
 #[cfg(target_os = "windows")]
 use widestring::U16CString;
 
-const ARG_DAEMON: &str = "--daemon";
-const ARG_FOREGROUND: &str = "--foreground";
-const ARG_STOP: &str = "--stop";
-
-fn pid_file_path() -> PathBuf {
-    std::env::temp_dir().join("remotefs-client.pid")
-}
-
-fn write_pid_file(pid: u32) -> Result<()> {
-    fs::write(pid_file_path(), pid.to_string()).context("Failed to write pid file")
-}
-
-fn read_pid_file() -> Result<u32> {
-    let pid_raw = fs::read_to_string(pid_file_path()).context("Daemon pid file not found")?;
-    let pid = pid_raw
-        .trim()
-        .parse::<u32>()
-        .context("Invalid pid file content")?;
-    Ok(pid)
-}
-
-fn remove_pid_file() {
-    let _ = fs::remove_file(pid_file_path());
-}
-
-fn should_stop_daemon() -> bool {
-    env::args().any(|a| a == ARG_STOP)
-}
-
 fn stop_daemon() -> Result<()> {
-    let pid = read_pid_file()?;
+    let pid = match daemon::running_daemon_pid()? {
+        Some(pid) => pid,
+        None => {
+            println!("No process running.");
+            return Ok(());
+        }
+    };
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
@@ -62,9 +39,9 @@ fn stop_daemon() -> Result<()> {
             let err = std::io::Error::last_os_error();
             
             if err.raw_os_error() == Some(libc::ESRCH) {
-                remove_pid_file();
-                
-                log::warn!("No running daemon found (stale pid file removed)");
+                daemon::remove_pid_file();
+
+                println!("No process running.");
                 return Ok(());
             }
             
@@ -74,28 +51,39 @@ fn stop_daemon() -> Result<()> {
 
     #[cfg(target_os = "windows")]
     {
-        let status = std::process::Command::new("taskkill")
+        let output = std::process::Command::new("taskkill")
             .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .status()
+            .output()
             .context("Failed to execute taskkill")?;
 
-        if !status.success() {
-            return Err(anyhow::anyhow!("taskkill failed for pid {} with status {}", pid, status));
+        if !output.status.success() {
+            if !daemon::is_process_running(pid) {
+                daemon::remove_pid_file();
+                println!("No process running.");
+                return Ok(());
+            }
+
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow::anyhow!(
+                "taskkill failed for pid {} with status {}: {}",
+                pid,
+                output.status,
+                stderr.trim()
+            ));
         }
     }
 
-    remove_pid_file();
+    daemon::remove_pid_file();
     println!("Client daemon stop requested for pid {}", pid);
     Ok(())
 }
 
-fn should_daemonize() -> bool {
-    let has_daemon = env::args().any(|a| a == ARG_DAEMON);
-    let is_foreground_child = env::args().any(|a| a == ARG_FOREGROUND);
-    has_daemon && !is_foreground_child
-}
-
 fn spawn_daemon_child() -> Result<()> {
+    if let Some(pid) = daemon::running_daemon_pid()? {
+        println!("Daemon already running with pid {}", pid);
+        return Ok(());
+    }
+
     let current_exe = env::current_exe().context("Failed to resolve current executable")?;
     let args: Vec<String> = env::args().skip(1).filter(|a| a != ARG_DAEMON).collect();
 
@@ -128,18 +116,18 @@ fn spawn_daemon_child() -> Result<()> {
     }
 
     let child = cmd.spawn().context("Failed to spawn daemon child process")?;
-    write_pid_file(child.id())?;
+    daemon::write_pid_file(child.id())?;
     
     println!("Client daemon started with pid {}", child.id());
     Ok(())
 }
 
 fn main() -> Result<()> {
-    if should_stop_daemon() {
+    if daemon::should_stop_daemon() {
         return stop_daemon();
     }
 
-    if should_daemonize() {
+    if daemon::should_daemonize() {
         return spawn_daemon_child();
     }
 

@@ -57,6 +57,7 @@ fn split_parent_and_name(path: &str) -> (String, String) {
         } else {
             format!("/{parent}")
         };
+        
         (parent_norm, name.to_string())
     } else {
         ("/".to_string(), normalized.to_string())
@@ -74,17 +75,20 @@ impl DokanyFs {
     fn next_ino(&self) -> u64 {
         let mut counter = self.ino_counter.lock().unwrap();
         let ino = *counter;
+        
         *counter += 1;
         ino
     }
 
     fn lookup_entry(&self, remote_path: &str) -> Result<(u64, FileEntry), i32> {
         let normalized = remote_path.trim_start_matches('/');
+        
         if normalized.is_empty() {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs_f64();
+            
             return Ok((1, FileEntry {
                 name: "/".to_string(),
                 is_dir: true,
@@ -103,6 +107,7 @@ impl DokanyFs {
         } else {
             self.api_client.list_directory(&parent).map_err(|e| e.errno)?
         };
+        
         if let Some(entry) = entries.into_iter().find(|e| e.name == name) {
             Ok((self.next_ino(), entry))
         } else {
@@ -112,11 +117,13 @@ impl DokanyFs {
 
     fn lookup_entry_fresh(&self, remote_path: &str) -> Result<(u64, FileEntry), i32> {
         let normalized = remote_path.trim_start_matches('/');
+        
         if normalized.is_empty() {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs_f64();
+            
             return Ok((1, FileEntry {
                 name: "/".to_string(),
                 is_dir: true,
@@ -140,38 +147,33 @@ impl DokanyFs {
     fn invalidate_path(&self, path: &str) {
         if let Ok(mut cache) = self.cache.lock() {
             cache.invalidate_all_for_path(path);
+
+            if let Some(stripped) = path.strip_prefix('/') {
+                if !stripped.is_empty() {
+                    cache.invalidate_all_for_path(stripped);
+                }
+            } else if !path.is_empty() {
+                let absolute = format!("/{path}");
+                cache.invalidate_all_for_path(&absolute);
+            }
         }
     }
 
     fn maybe_cleanup_cache(&self) {
-        if let Ok(mut last_cleanup) = self.last_cleanup.lock()
-            && last_cleanup.elapsed() >= METADATA_CACHE_TTL
-        {
+        if let Ok(mut last_cleanup) = self.last_cleanup.lock() && last_cleanup.elapsed() >= METADATA_CACHE_TTL {
             if let Ok(mut cache) = self.cache.lock() {
                 cache.cleanup_expired();
             }
+            
             *last_cleanup = Instant::now();
         }
     }
 }
 
-impl<'c, 'h> FileSystemHandler<'c, 'h> for DokanyFs
-where
-    'h: 'c,
-{
+impl<'c, 'h> FileSystemHandler<'c, 'h> for DokanyFs where 'h: 'c {
     type Context = ();
 
-    fn create_file(
-        &'h self,
-        file_name: &U16CStr,
-        _security_context: &IO_SECURITY_CONTEXT,
-        _desired_access: u32,
-        _file_attributes: u32,
-        _share_access: u32,
-        create_disposition: u32,
-        create_options: u32,
-        _info: &mut OperationInfo<'c, 'h, Self>,
-    ) -> OperationResult<CreateFileInfo<Self::Context>> {
+    fn create_file(&'h self, file_name: &U16CStr, _security_context: &IO_SECURITY_CONTEXT, _desired_access: u32, _file_attributes: u32, _share_access: u32, create_disposition: u32, create_options: u32, _info: &mut OperationInfo<'c, 'h, Self>) -> OperationResult<CreateFileInfo<Self::Context>> {
         let _guard = self.api_client.enter_runtime();
 
         self.maybe_cleanup_cache();
@@ -180,7 +182,6 @@ where
         let is_dir_request = (create_options & FILE_DIRECTORY_FILE) != 0;
         let non_dir_request = (create_options & FILE_NON_DIRECTORY_FILE) != 0;
 
-        // Prepariamo il percorso del padre per l'invalidazione successiva
         let (parent_path, _) = split_parent_and_name(&path_str);
 
         match self.lookup_entry(&path_str) {
@@ -188,9 +189,11 @@ where
                 if is_dir_request && !info.is_dir {
                     return Err(STATUS_NOT_A_DIRECTORY);
                 }
+                
                 if non_dir_request && info.is_dir {
                     return Err(STATUS_ACCESS_DENIED);
                 }
+                
                 if create_disposition == FILE_CREATE {
                     return Err(STATUS_ACCESS_DENIED);
                 }
@@ -206,6 +209,7 @@ where
                     create_disposition,
                     FILE_CREATE | FILE_OPEN_IF | FILE_OVERWRITE_IF | FILE_SUPERSEDE
                 );
+                
                 if !can_create {
                     return Err(STATUS_OBJECT_NAME_NOT_FOUND);
                 }
@@ -215,7 +219,6 @@ where
                         .create_directory(&path_str)
                         .map_err(|e| posix_to_ntstatus(e.errno))?;
                     
-                    // IMPORTANTE: Invalida sia il nuovo percorso che il padre
                     self.invalidate_path(&path_str);
                     self.invalidate_path(&parent_path);
 
@@ -243,12 +246,7 @@ where
         }
     }
 
-    fn get_file_information(
-        &'h self,
-        file_name: &U16CStr,
-        _info: &OperationInfo<'c, 'h, Self>,
-        _context: &'c Self::Context,
-    ) -> OperationResult<FileInfo> {
+    fn get_file_information(&'h self, file_name: &U16CStr, _info: &OperationInfo<'c, 'h, Self>, _context: &'c Self::Context) -> OperationResult<FileInfo> {
         let _guard = self.api_client.enter_runtime();
 
         self.maybe_cleanup_cache();
@@ -273,13 +271,7 @@ where
         }
     }
 
-    fn find_files(
-        &'h self,
-        file_name: &U16CStr,
-        mut fill_find_data: impl FnMut(&FindData) -> FillDataResult,
-        _info: &OperationInfo<'c, 'h, Self>,
-        _context: &'c Self::Context,
-    ) -> OperationResult<()> {
+    fn find_files(&'h self, file_name: &U16CStr, mut fill_find_data: impl FnMut(&FindData) -> FillDataResult, _info: &OperationInfo<'c, 'h, Self>, _context: &'c Self::Context) -> OperationResult<()> {
         let _guard = self.api_client.enter_runtime();
 
         self.maybe_cleanup_cache();
@@ -321,14 +313,7 @@ where
         Ok(())
     }
 
-    fn read_file(
-        &'h self,
-        file_name: &U16CStr,
-        offset: i64,
-        buffer: &mut [u8],
-        _info: &OperationInfo<'c, 'h, Self>,
-        _context: &'c Self::Context,
-    ) -> OperationResult<u32> {
+    fn read_file(&'h self, file_name: &U16CStr, offset: i64, buffer: &mut [u8], _info: &OperationInfo<'c, 'h, Self>, _context: &'c Self::Context) -> OperationResult<u32> {
         let _guard = self.api_client.enter_runtime();
 
         self.maybe_cleanup_cache();
@@ -347,17 +332,11 @@ where
 
         let len = data.len().min(buffer.len());
         buffer[..len].copy_from_slice(&data[..len]);
+        
         Ok(len as u32)
     }
 
-    fn write_file(
-        &'h self,
-        file_name: &U16CStr,
-        offset: i64,
-        buffer: &[u8],
-        _info: &OperationInfo<'c, 'h, Self>,
-        _context: &'c Self::Context,
-    ) -> OperationResult<u32> {
+    fn write_file(&'h self, file_name: &U16CStr, offset: i64, buffer: &[u8], _info: &OperationInfo<'c, 'h, Self>, _context: &'c Self::Context) -> OperationResult<u32> {
         let _guard = self.api_client.enter_runtime();
 
         self.maybe_cleanup_cache();
@@ -376,16 +355,10 @@ where
         Ok(buffer.len() as u32)
     }
 
-    fn delete_file(
-        &'h self,
-        file_name: &U16CStr,
-        info: &OperationInfo<'c, 'h, Self>,
-        _context: &'c Self::Context,
-    ) -> OperationResult<()> {
+    fn delete_file(&'h self, file_name: &U16CStr, info: &OperationInfo<'c, 'h, Self>, _context: &'c Self::Context) -> OperationResult<()> {
         let _guard = self.api_client.enter_runtime();
         self.maybe_cleanup_cache();
 
-        // Kernel requested a file delete callback: if target is seen as directory, reject.
         if info.is_dir() {
             return Err(STATUS_FILE_IS_A_DIRECTORY);
         }
@@ -393,23 +366,19 @@ where
         let path_raw = file_name.to_string_lossy();
         let path_str = normalize_remote_path(&path_raw);
 
-        // 1. Controllo preliminare
         match self.lookup_entry_fresh(&path_str) {
             Ok((_, info)) => {
                 if info.is_dir {
-                    // Errore: stai cercando di eliminare una cartella come se fosse un file
                     return Err(STATUS_ACCESS_DENIED); 
                 }
             }
             Err(e) => return Err(posix_to_ntstatus(e)),
         }
 
-        // 2. Procedi con l'eliminazione
         self.api_client
             .delete(&path_str)
             .map_err(|e| posix_to_ntstatus(e.errno))?;
 
-        // 3. Invalida il percorso e il padre per aggiornare la UI
         let (parent_path, _) = split_parent_and_name(&path_str);
         self.invalidate_path(&path_str);
         self.invalidate_path(&parent_path);
@@ -417,16 +386,10 @@ where
         Ok(())
     }
 
-    fn delete_directory(
-        &'h self,
-        file_name: &U16CStr,
-        info: &OperationInfo<'c, 'h, Self>,
-        _context: &'c Self::Context,
-    ) -> OperationResult<()> {
+    fn delete_directory(&'h self, file_name: &U16CStr, info: &OperationInfo<'c, 'h, Self>, _context: &'c Self::Context) -> OperationResult<()> {
         let _guard = self.api_client.enter_runtime();
         self.maybe_cleanup_cache();
 
-        // Kernel requested a directory delete callback: if target is not directory, reject.
         if !info.is_dir() {
             return Err(STATUS_NOT_A_DIRECTORY);
         }
@@ -434,7 +397,6 @@ where
         let path_raw = file_name.to_string_lossy();
         let path_str = normalize_remote_path(&path_raw);
 
-        // 1. Controllo preliminare
         match self.lookup_entry_fresh(&path_str) {
             Ok((_, info)) => {
                 if !info.is_dir {
@@ -445,12 +407,10 @@ where
             Err(e) => return Err(posix_to_ntstatus(e)),
         }
 
-        // 2. Procedi con l'eliminazione
         self.api_client
             .delete(&path_str)
             .map_err(|e| posix_to_ntstatus(e.errno))?;
 
-        // 3. Invalida il percorso e il padre
         let (parent_path, _) = split_parent_and_name(&path_str);
         self.invalidate_path(&path_str);
         self.invalidate_path(&parent_path);
@@ -458,14 +418,7 @@ where
         Ok(())
     }
 
-    fn move_file(
-        &'h self,
-        file_name: &U16CStr,
-        new_file_name: &U16CStr,
-        _replace_if_existing: bool,
-        _info: &OperationInfo<'c, 'h, Self>,
-        _context: &'c Self::Context,
-    ) -> OperationResult<()> {
+    fn move_file(&'h self, file_name: &U16CStr, new_file_name: &U16CStr, _replace_if_existing: bool, _info: &OperationInfo<'c, 'h, Self>, _context: &'c Self::Context) -> OperationResult<()> {
         let _guard = self.api_client.enter_runtime();
 
         self.maybe_cleanup_cache();
@@ -479,6 +432,7 @@ where
             .map_err(|e| posix_to_ntstatus(e.errno))?;
         self.invalidate_path(&old_str);
         self.invalidate_path(&new_str);
+        
         Ok(())
     }
 
@@ -500,23 +454,11 @@ where
         })
     }
 
-    fn set_end_of_file(
-        &'h self,
-        _file_name: &U16CStr,
-        _offset: i64,
-        _info: &OperationInfo<'c, 'h, Self>,
-        _context: &'c Self::Context,
-    ) -> OperationResult<()> {
+    fn set_end_of_file(&'h self, _file_name: &U16CStr, _offset: i64, _info: &OperationInfo<'c, 'h, Self>, _context: &'c Self::Context) -> OperationResult<()> {
         Ok(())
     }
 
-    fn set_allocation_size(
-        &'h self,
-        _file_name: &U16CStr,
-        _alloc_size: i64,
-        _info: &OperationInfo<'c, 'h, Self>,
-        _context: &'c Self::Context,
-    ) -> OperationResult<()> {
+    fn set_allocation_size(&'h self, _file_name: &U16CStr, _alloc_size: i64, _info: &OperationInfo<'c, 'h, Self>, _context: &'c Self::Context) -> OperationResult<()> {
         Ok(())
     }
 }
@@ -531,8 +473,6 @@ pub fn run_dokany_client(api_client: ApiClient, mountpoint: String) -> Result<()
     };
     let mp = U16CString::from_str(&mountpoint)?;
 
-    // 1. Usiamo un Arc esplicito. Questo garantisce che l'oggetto 
-    // non si muova e che l'indirizzo di memoria sia stabile.
     let fs = Arc::new(DokanyFs {
         api_client: Arc::new(api_client),
         ino_counter: Mutex::new(2),
@@ -543,7 +483,6 @@ pub fn run_dokany_client(api_client: ApiClient, mountpoint: String) -> Result<()
     let mut options = MountOptions::default();
     options.single_thread = false;
     
-    // 2. Passiamo il riferimento dell'Arc
     let mut mounter = FileSystemMounter::new(&*fs, mp.as_ucstr(), &options);
     
     log::info!("Mounting on {}...", mountpoint);
