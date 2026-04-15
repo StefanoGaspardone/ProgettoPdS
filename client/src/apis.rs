@@ -25,6 +25,7 @@ struct SetAttrsRequest {
     mode: Option<u32>,
 }
 
+#[derive(Clone)]
 pub struct ApiClient {
     base_url: String,
     client: Client,

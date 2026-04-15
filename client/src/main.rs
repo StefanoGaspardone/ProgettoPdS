@@ -11,9 +11,12 @@ use anyhow::{Context, Result};
 use crate::apis::ApiClient;
 use crate::daemon::{ARG_DAEMON, ARG_FOREGROUND};
 use dotenvy::dotenv;
-use log::info;
+use log::{info, warn};
 use std::env;
 use std::process::Stdio;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::process::{self, Command};
 #[cfg(target_os = "windows")]
@@ -122,6 +125,64 @@ fn spawn_daemon_child() -> Result<()> {
     Ok(())
 }
 
+fn healthcheck_interval() -> Duration {
+    let default_secs = 5;
+
+    match env::var("SERVER_HEALTHCHECK_INTERVAL_SECS") {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(seconds) if seconds > 0 => Duration::from_secs(seconds),
+            _ => {
+                warn!(
+                    "Invalid SERVER_HEALTHCHECK_INTERVAL_SECS='{}'; using default {}",
+                    raw,
+                    default_secs
+                );
+                Duration::from_secs(default_secs)
+            }
+        },
+        Err(_) => Duration::from_secs(default_secs),
+    }
+}
+
+fn start_server_health_monitor(
+    api_client: ApiClient,
+    interval: Duration,
+) -> Result<(mpsc::Sender<()>, thread::JoinHandle<()>)> {
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+
+    let handle = thread::Builder::new()
+        .name("server-health-monitor".to_string())
+        .spawn(move || {
+            let _runtime_guard = api_client.enter_runtime();
+            let mut server_up = true;
+
+            loop {
+                match stop_rx.recv_timeout(interval) {
+                    Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                }
+
+                match api_client.health_check() {
+                    Ok(_) => {
+                        if !server_up {
+                            info!("Server is up again");
+                            server_up = true;
+                        }
+                    }
+                    Err(err) => {
+                        if server_up {
+                            warn!("Server is down: {}", err);
+                            server_up = false;
+                        }
+                    }
+                }
+            }
+        })
+        .context("Failed to start server health monitor thread")?;
+
+    Ok((stop_tx, handle))
+}
+
 fn main() -> Result<()> {
     if daemon::should_stop_daemon() {
         return stop_daemon();
@@ -158,6 +219,7 @@ fn main() -> Result<()> {
         "REMOTEFS_CACHE_SIZE_MB",
         "REMOTEFS_FUSE_THREADS",
         "REMOTEFS_FUSE_CLONE_FD",
+        "SERVER_HEALTHCHECK_INTERVAL_SECS",
     ] {
         if let Ok(value) = env::var(key) {
             info!("{}={}", key, value);
@@ -239,21 +301,36 @@ fn main() -> Result<()> {
     
     info!("Successfully connected to server");
 
+    let health_interval = healthcheck_interval();
+    let (monitor_stop_tx, monitor_handle) =
+        start_server_health_monitor(api_client.clone(), health_interval)?;
+    info!(
+        "Server health monitor started (interval={}s)",
+        health_interval.as_secs()
+    );
+
     #[cfg(target_os = "windows")]
-    {
+    let run_result = {
         info!("Starting Dokany driver...");
         
         drop(_guard); 
-        dokany::run_dokany_client(api_client, mount_point)?;
-    }
+        dokany::run_dokany_client(api_client, mount_point)
+    };
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    {
+    let run_result = {
         info!("Starting FUSE driver...");
-        rt.block_on(async {
+        rt.block_on(async move {
             fuser::run_fuser_client(api_client, mount_point).await
-        })?;
+        })
+    };
+
+    let _ = monitor_stop_tx.send(());
+    if monitor_handle.join().is_err() {
+        warn!("Server health monitor thread terminated unexpectedly");
     }
+
+    run_result?;
 
     Ok(())
 }
