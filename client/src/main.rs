@@ -13,6 +13,8 @@ use crate::daemon::{ARG_DAEMON, ARG_FOREGROUND};
 use dotenvy::dotenv;
 use log::{info, warn};
 use std::env;
+use std::fs;
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::mpsc;
 use std::thread;
@@ -90,12 +92,19 @@ fn spawn_daemon_child() -> Result<()> {
     let current_exe = env::current_exe().context("Failed to resolve current executable")?;
     let args: Vec<String> = env::args().skip(1).filter(|a| a != ARG_DAEMON).collect();
 
+    let log_dir = Path::new("logs");
+    fs::create_dir_all(log_dir).context("Failed to create logs directory")?;
+    let log_file_path = log_dir.join("remotefs.log");
+
+    let log_file = fs::File::create(&log_file_path)
+        .context("Failed to create log file")?;
+
     let mut cmd = std::process::Command::new(current_exe);
     cmd.args(args)
         .arg(ARG_FOREGROUND)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(log_file.try_clone()?)
+        .stderr(log_file);
 
     #[cfg(target_os = "windows")]
     {
@@ -112,7 +121,6 @@ fn spawn_daemon_child() -> Result<()> {
                 if libc::setsid() == -1 {
                     return Err(std::io::Error::last_os_error());
                 }
-
                 Ok(())
             });
         }
@@ -121,7 +129,7 @@ fn spawn_daemon_child() -> Result<()> {
     let child = cmd.spawn().context("Failed to spawn daemon child process")?;
     daemon::write_pid_file(child.id())?;
     
-    println!("Client daemon started with pid {}", child.id());
+    println!("Client daemon started with pid {}. Logs: {}", child.id(), log_file_path.display());
     Ok(())
 }
 
