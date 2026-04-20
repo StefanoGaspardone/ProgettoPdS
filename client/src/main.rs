@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use crate::apis::ApiClient;
 use crate::daemon::{ARG_DAEMON, ARG_FOREGROUND};
 use dotenvy::dotenv;
-use log::{info, warn};
+use log::{debug, info, warn};
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -152,9 +152,74 @@ fn healthcheck_interval() -> Duration {
     }
 }
 
+fn healthcheck_failure_threshold() -> u32 {
+    let default_failures = 2;
+
+    match env::var("SERVER_HEALTHCHECK_FAILURE_THRESHOLD") {
+        Ok(raw) => match raw.trim().parse::<u32>() {
+            Ok(failures) if failures > 0 => failures,
+            _ => {
+                warn!(
+                    "Invalid SERVER_HEALTHCHECK_FAILURE_THRESHOLD='{}'; using default {}",
+                    raw,
+                    default_failures
+                );
+                default_failures
+            }
+        },
+        Err(_) => default_failures,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HealthTransition {
+    None,
+    Down,
+    Up,
+}
+
+#[derive(Debug)]
+struct HealthMonitorState {
+    server_up: bool,
+    consecutive_failures: u32,
+    failure_threshold: u32,
+}
+
+impl HealthMonitorState {
+    fn new(failure_threshold: u32) -> Self {
+        Self {
+            server_up: true,
+            consecutive_failures: 0,
+            failure_threshold: failure_threshold.max(1),
+        }
+    }
+
+    fn on_success(&mut self) -> HealthTransition {
+        self.consecutive_failures = 0;
+        if self.server_up {
+            HealthTransition::None
+        } else {
+            self.server_up = true;
+            HealthTransition::Up
+        }
+    }
+
+    fn on_failure(&mut self) -> (HealthTransition, u32) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+
+        if self.server_up && self.consecutive_failures >= self.failure_threshold {
+            self.server_up = false;
+            (HealthTransition::Down, self.consecutive_failures)
+        } else {
+            (HealthTransition::None, self.consecutive_failures)
+        }
+    }
+}
+
 fn start_server_health_monitor(
     api_client: ApiClient,
     interval: Duration,
+    failure_threshold: u32,
 ) -> Result<(mpsc::Sender<()>, thread::JoinHandle<()>)> {
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
 
@@ -162,7 +227,7 @@ fn start_server_health_monitor(
         .name("server-health-monitor".to_string())
         .spawn(move || {
             let _runtime_guard = api_client.enter_runtime();
-            let mut server_up = true;
+            let mut monitor_state = HealthMonitorState::new(failure_threshold);
 
             loop {
                 match stop_rx.recv_timeout(interval) {
@@ -171,16 +236,34 @@ fn start_server_health_monitor(
                 }
 
                 match api_client.health_check() {
-                    Ok(_) => {
-                        if !server_up {
+                    Ok(_) => match monitor_state.on_success() {
+                        HealthTransition::Up => {
                             info!("Server is up again");
-                            server_up = true;
                         }
-                    }
+                        HealthTransition::None | HealthTransition::Down => {}
+                    },
                     Err(err) => {
-                        if server_up {
-                            warn!("Server is down: {}", err);
-                            server_up = false;
+                        let (transition, failures) = monitor_state.on_failure();
+
+                        match transition {
+                            HealthTransition::Down => {
+                                warn!(
+                                    "Server is down after {} consecutive failed health checks: {}",
+                                    failures,
+                                    err
+                                );
+                            }
+                            HealthTransition::None => {
+                                if monitor_state.server_up {
+                                    debug!(
+                                        "Transient health check failure ({}/{}): {}",
+                                        failures,
+                                        monitor_state.failure_threshold,
+                                        err
+                                    );
+                                }
+                            }
+                            HealthTransition::Up => {}
                         }
                     }
                 }
@@ -228,6 +311,7 @@ fn main() -> Result<()> {
         "REMOTEFS_FUSE_THREADS",
         "REMOTEFS_FUSE_CLONE_FD",
         "SERVER_HEALTHCHECK_INTERVAL_SECS",
+        "SERVER_HEALTHCHECK_FAILURE_THRESHOLD",
     ] {
         if let Ok(value) = env::var(key) {
             info!("{}={}", key, value);
@@ -310,11 +394,13 @@ fn main() -> Result<()> {
     info!("Successfully connected to server");
 
     let health_interval = healthcheck_interval();
+    let health_failure_threshold = healthcheck_failure_threshold();
     let (monitor_stop_tx, monitor_handle) =
-        start_server_health_monitor(api_client.clone(), health_interval)?;
+        start_server_health_monitor(api_client.clone(), health_interval, health_failure_threshold)?;
     info!(
-        "Server health monitor started (interval={}s)",
-        health_interval.as_secs()
+        "Server health monitor started (interval={}s, failure-threshold={})",
+        health_interval.as_secs(),
+        health_failure_threshold
     );
 
     #[cfg(target_os = "windows")]
@@ -341,4 +427,27 @@ fn main() -> Result<()> {
     run_result?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HealthMonitorState, HealthTransition};
+
+    #[test]
+    fn monitor_requires_consecutive_failures_before_reporting_down() {
+        let mut state = HealthMonitorState::new(2);
+
+        assert_eq!(state.on_failure(), (HealthTransition::None, 1));
+        assert_eq!(state.on_success(), HealthTransition::None);
+
+        assert_eq!(state.on_failure(), (HealthTransition::None, 1));
+        assert_eq!(state.on_failure(), (HealthTransition::Down, 2));
+        assert_eq!(state.on_success(), HealthTransition::Up);
+    }
+
+    #[test]
+    fn monitor_clamps_threshold_to_one() {
+        let mut state = HealthMonitorState::new(0);
+        assert_eq!(state.on_failure(), (HealthTransition::Down, 1));
+    }
 }
