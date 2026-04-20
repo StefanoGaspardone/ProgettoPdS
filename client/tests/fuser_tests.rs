@@ -143,5 +143,108 @@ mod fuser {
             assert!(Arc::ptr_eq(&a1, &a2));
             assert!(!Arc::ptr_eq(&a1, &b));
         }
+
+        #[test]
+        fn test_fuser_async_write_and_flush_performance() {
+            use httpmock::MockServer;
+            use tokio::runtime::Runtime;
+
+            let server = MockServer::start();
+            let write_mock = server.mock(|when, then| {
+                when.method(httpmock::Method::PATCH).path("/files/bigfile.bin");
+                // Simulate a 100ms network delay per chunk
+                then.delay(Duration::from_millis(100)).status(200);
+            });
+
+            let rt = Runtime::new().unwrap();
+            let api = ApiClient::new(server.base_url(), rt.handle().clone()).unwrap();
+            let fs = FuserFS::new(api);
+            let _guard = fs.api_client.enter_runtime();
+
+            let ino = 99;
+            let path = "/bigfile.bin".to_string();
+            
+            let start_queue = Instant::now();
+            
+            // Simulate 10 concurrent chunks being written rapidly by the OS
+            for i in 0..10 {
+                let api_clone = fs.api_client.clone();
+                let path_clone = path.clone();
+                let offset = i * 1024;
+                
+                let handle = fs.api_client.spawn_task_with_handle(async move {
+                    api_clone.write_file_chunk_async(&path_clone, offset, vec![0; 1024]).await
+                });
+                
+                fs.pending_writes.lock().unwrap().entry(ino).or_default().push(handle);
+            }
+            
+            let queue_duration = start_queue.elapsed();
+            let start_flush = Instant::now();
+            
+            // Simulate fsync or file close (blocks until all chunk tasks finish)
+            let handles = fs.pending_writes.lock().unwrap().remove(&ino).unwrap_or_default();
+            let mut success = true;
+            fs.api_client.block_on(async {
+                for handle in handles {
+                    if let Ok(Err(_)) | Err(_) = handle.await {
+                        success = false;
+                    }
+                }
+            });
+            
+            let flush_duration = start_flush.elapsed();
+            
+            assert!(success, "All writes should succeed");
+            write_mock.assert_hits(10);
+            
+            // Queuing should be instant, while Flush should take ~100ms because tasks overlap.
+            // If it were blocking, 10 chunks * 100ms would take >1 second!
+            assert!(queue_duration < Duration::from_millis(200), "Queuing took too long: {:?}", queue_duration);
+            assert!(flush_duration >= Duration::from_millis(100), "Flush too fast: {:?}", flush_duration);
+            assert!(flush_duration < Duration::from_millis(800), "Flush too slow (not concurrent): {:?}", flush_duration);
+            
+            println!("Fuser Queue time: {:?}, Flush time: {:?}", queue_duration, flush_duration);
+        }
+
+        #[test]
+        fn test_fuser_async_write_failure_propagation() {
+            use httpmock::MockServer;
+            use tokio::runtime::Runtime;
+
+            let server = MockServer::start();
+            let write_mock = server.mock(|when, then| {
+                when.method(httpmock::Method::PATCH).path("/files/fail.bin");
+                // A 400 Bad Request error triggers immediate failure without exponential retry loops
+                then.status(400);
+            });
+
+            let rt = Runtime::new().unwrap();
+            let api = ApiClient::new(server.base_url(), rt.handle().clone()).unwrap();
+            let fs = FuserFS::new(api);
+            let _guard = fs.api_client.enter_runtime();
+
+            let ino = 42;
+            let path = "/fail.bin".to_string();
+            
+            let api_clone = fs.api_client.clone();
+            let handle = fs.api_client.spawn_task_with_handle(async move {
+                api_clone.write_file_chunk_async(&path, 0, vec![1, 2, 3]).await
+            });
+            fs.pending_writes.lock().unwrap().entry(ino).or_default().push(handle);
+            
+            let handles = fs.pending_writes.lock().unwrap().remove(&ino).unwrap_or_default();
+            let mut success = true;
+            fs.api_client.block_on(async {
+                for handle in handles {
+                    if let Ok(Err(_)) | Err(_) = handle.await {
+                        success = false;
+                    }
+                }
+            });
+            
+            assert!(!success, "Write should fail and propagate I/O rejection to flush");
+            write_mock.assert_hits(1);
+        }
     }
 }

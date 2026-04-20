@@ -271,7 +271,7 @@ pub async fn write_file(
     };
 
     if let Some(parent) = full_path.parent() {
-        if let Err(e) = fs::create_dir_all(parent) {
+        if let Err(e) = tokio::fs::create_dir_all(parent).await {
             return Ok(fs_error_json(&e, "Failed to create directories"));
         }
     }
@@ -285,7 +285,6 @@ pub async fn write_file(
                 file.write_all(&bytes).await.map_err(actix_web::error::ErrorInternalServerError)?;
                 total += bytes.len();
             }
-            file.flush().await.map_err(actix_web::error::ErrorInternalServerError)?;
             
             Ok(HttpResponse::Ok().json(ApiResponse { success: true, message: None, bytes_written: Some(total) }))
         }
@@ -334,7 +333,7 @@ pub async fn patch_file(
     let expected_len = end - start + 1;
 
     if let Some(parent) = full_path.parent() {
-        if let Err(e) = fs::create_dir_all(parent) {
+        if let Err(e) = tokio::fs::create_dir_all(parent).await {
             return Ok(fs_error_json(&e, "Failed to create parent directories"));
         }
     }
@@ -349,13 +348,6 @@ pub async fn patch_file(
         Ok(f) => f,
         Err(e) => return Ok(fs_error_json(&e, "Failed to open file")),
     };
-
-    let current_len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
-    if end + 1 > current_len {
-        if let Err(e) = file.set_len(end + 1).await { // end è inclusivo
-            return Ok(fs_error_json(&e, "Failed to extend file"));
-        }
-    }
 
     if let Err(e) = file.seek(SeekFrom::Start(start)).await {
         return Ok(fs_error_json(&e, "Failed to seek"));
@@ -377,10 +369,6 @@ pub async fn patch_file(
 
     if (total as u64) != expected_len {
         return Ok(HttpResponse::BadRequest().json("Payload size does not match Content-Range"));
-    }
-
-    if let Err(e) = file.flush().await {
-        return Ok(fs_error_json(&e, "Failed to flush file"));
     }
 
     Ok(HttpResponse::Ok().json(ApiResponse { success: true, message: None, bytes_written: Some(total) }))
@@ -436,7 +424,7 @@ pub async fn create_directory(
         None => return Ok(HttpResponse::BadRequest().json("Invalid path")),
     };
 
-    match fs::create_dir_all(&full_path) {
+    match tokio::fs::create_dir_all(&full_path).await {
         Ok(_) => Ok(HttpResponse::Ok().json(ApiResponse {
             success: true,
             message: None,
@@ -461,9 +449,9 @@ pub async fn delete_file(
     }
 
     let result = if full_path.is_dir() {
-        fs::remove_dir(&full_path)
+        tokio::fs::remove_dir(&full_path).await
     } else {
-        fs::remove_file(&full_path)
+        tokio::fs::remove_file(&full_path).await
     };
 
     match result {
@@ -490,17 +478,17 @@ pub async fn rename_entry(
         None => return Ok(HttpResponse::BadRequest().json("Invalid 'to' path")),
     };
 
-    if !from.exists() {
+    if !tokio::fs::try_exists(&from).await.unwrap_or(false) {
         return Ok(HttpResponse::NotFound().json("Source not found"));
     }
 
     if let Some(parent) = to.parent() {
-        if let Err(e) = fs::create_dir_all(parent) {
+        if let Err(e) = tokio::fs::create_dir_all(parent).await {
             return Ok(fs_error_json(&e, "Failed to prepare destination"));
         }
     }
 
-    match fs::rename(&from, &to) {
+    match tokio::fs::rename(&from, &to).await {
         Ok(_) => Ok(HttpResponse::Ok().json(ApiResponse { success: true, message: None, bytes_written: None })),
         Err(e) => Ok(fs_error_json(&e, "Failed to rename")),
     }
@@ -633,10 +621,10 @@ async fn stream_file_slice(
     }
 
     let response = if let Some(max_len) = len {
-        let stream = ReaderStream::new(file.take(max_len));
+        let stream = ReaderStream::with_capacity(file.take(max_len), 65536);
         builder.streaming(stream)
     } else {
-        let stream = ReaderStream::new(file);
+        let stream = ReaderStream::with_capacity(file, 65536);
         builder.streaming(stream)
     };
 

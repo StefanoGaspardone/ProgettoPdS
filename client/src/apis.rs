@@ -48,17 +48,81 @@ impl ApiClient {
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(60))
+            .tcp_nodelay(true)
+            .pool_max_idle_per_host(32)
             .build()
             .context("Failed to create HTTP client")?;
 
         Ok(Self { base_url, client, runtime })
     }
 
+    pub fn spawn_task<F>(&self, future: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.runtime.spawn(future);
+    }
+
+    pub fn spawn_task_with_handle<F>(&self, future: F) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.runtime.spawn(future)
+    }
+
+    pub async fn write_file_chunk_async(&self, path: &str, offset: u64, data: Vec<u8>) -> Result<(), ApiError> {
+        Self::validate_path(path, "write_file_chunk_async")?;
+        let url = format!("{}/files/{}", self.base_url, path.trim_start_matches('/'));
+        
+        if data.is_empty() {
+            return Ok(());
+        }
+
+        let end = offset
+            .checked_add(data.len() as u64 - 1)
+            .ok_or_else(|| ApiError::io_error("write_file_chunk_async", "Invalid range overflow"))?;
+            
+        let max_retries = 4;
+        let mut attempt = 0;
+        
+        loop {
+            let response = self.client.patch(&url)
+                .header("Content-Range", format!("bytes {}-{}/*", offset, end))
+                .body(data.clone())
+                .send()
+                .await;
+
+            match response {
+                Ok(resp) if resp.status().is_success() => return Ok(()),
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_client_error() && status.as_u16() != 429 && status.as_u16() != 408 {
+                        return Err(ApiError::from_status(status, "write_file_chunk_async"));
+                    }
+                    if attempt >= max_retries {
+                        return Err(ApiError::from_status(status, "write_file_chunk_async"));
+                    }
+                    log::warn!("write_file_chunk_async failed (HTTP {}). Retrying ({}/{})", status, attempt + 1, max_retries);
+                },
+                Err(e) => {
+                    if attempt >= max_retries {
+                        return Err(ApiError::from_network_error("write_file_chunk_async", &e));
+                    }
+                    log::warn!("write_file_chunk_async network error ({}). Retrying ({}/{})", e, attempt + 1, max_retries);
+                }
+            }
+            
+            attempt += 1;
+            tokio::time::sleep(tokio::time::Duration::from_millis(500 * (1 << attempt))).await;
+        }
+    }
+
     pub fn enter_runtime(&self) -> EnterGuard<'_> {
         self.runtime.enter()
     }
 
-    fn block_on<F: Future>(&self, future: F) -> F::Output {
+    pub fn block_on<F: Future>(&self, future: F) -> F::Output {
         self.runtime.block_on(future)
     }
 

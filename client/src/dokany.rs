@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -69,6 +70,7 @@ struct DokanyFs {
     ino_counter: Mutex<u64>,
     cache: Mutex<CacheManager>,
     last_cleanup: Mutex<Instant>,
+    pending_writes: Mutex<HashMap<String, Vec<tokio::task::JoinHandle<Result<(), crate::apis::ApiError>>>>>,
 }
 
 impl DokanyFs {
@@ -343,9 +345,39 @@ impl<'c, 'h> FileSystemHandler<'c, 'h> for DokanyFs where 'h: 'c {
         let path_raw = file_name.to_string_lossy();
         let path_str = normalize_remote_path(&path_raw);
 
-        self.api_client
-            .write_file_chunk(&path_str, offset.max(0) as u64, buffer)
-            .map_err(|e| posix_to_ntstatus(e.errno))?;
+        let data = buffer.to_vec();
+        let api = self.api_client.clone();
+        let path_clone = path_str.clone();
+
+        let handle = self.api_client.spawn_task_with_handle(async move {
+            api.write_file_chunk_async(&path_clone, offset.max(0) as u64, data).await
+        });
+
+        let to_await = {
+            let mut pending = self.pending_writes.lock().unwrap();
+            let handles = pending.entry(path_str.clone()).or_default();
+            handles.push(handle);
+            
+            if handles.len() > 32 {
+                handles.drain(0..16).collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            }
+        };
+
+        let mut success = true;
+        if !to_await.is_empty() {
+            self.api_client.block_on(async {
+                for h in to_await {
+                    if let Ok(Err(_)) | Err(_) = h.await {
+                        success = false;
+                    }
+                }
+            });
+        }
+        if !success {
+            return Err(STATUS_IO_DEVICE_ERROR);
+        }
 
         let (parent_path, _) = split_parent_and_name(&path_str);
 
@@ -355,13 +387,9 @@ impl<'c, 'h> FileSystemHandler<'c, 'h> for DokanyFs where 'h: 'c {
         Ok(buffer.len() as u32)
     }
 
-    fn delete_file(&'h self, file_name: &U16CStr, info: &OperationInfo<'c, 'h, Self>, _context: &'c Self::Context) -> OperationResult<()> {
+    fn delete_file(&'h self, file_name: &U16CStr, _info: &OperationInfo<'c, 'h, Self>, _context: &'c Self::Context) -> OperationResult<()> {
         let _guard = self.api_client.enter_runtime();
         self.maybe_cleanup_cache();
-
-        if info.is_dir() {
-            return Err(STATUS_FILE_IS_A_DIRECTORY);
-        }
 
         let path_raw = file_name.to_string_lossy();
         let path_str = normalize_remote_path(&path_raw);
@@ -386,13 +414,9 @@ impl<'c, 'h> FileSystemHandler<'c, 'h> for DokanyFs where 'h: 'c {
         Ok(())
     }
 
-    fn delete_directory(&'h self, file_name: &U16CStr, info: &OperationInfo<'c, 'h, Self>, _context: &'c Self::Context) -> OperationResult<()> {
+    fn delete_directory(&'h self, file_name: &U16CStr, _info: &OperationInfo<'c, 'h, Self>, _context: &'c Self::Context) -> OperationResult<()> {
         let _guard = self.api_client.enter_runtime();
         self.maybe_cleanup_cache();
-
-        if !info.is_dir() {
-            return Err(STATUS_NOT_A_DIRECTORY);
-        }
 
         let path_raw = file_name.to_string_lossy();
         let path_str = normalize_remote_path(&path_raw);
@@ -461,6 +485,45 @@ impl<'c, 'h> FileSystemHandler<'c, 'h> for DokanyFs where 'h: 'c {
     fn set_allocation_size(&'h self, _file_name: &U16CStr, _alloc_size: i64, _info: &OperationInfo<'c, 'h, Self>, _context: &'c Self::Context) -> OperationResult<()> {
         Ok(())
     }
+
+    fn flush_file_buffers(&'h self, file_name: &U16CStr, _info: &OperationInfo<'c, 'h, Self>, _context: &'c Self::Context) -> OperationResult<()> {
+        let _guard = self.api_client.enter_runtime();
+        
+        let path_raw = file_name.to_string_lossy();
+        let path_str = normalize_remote_path(&path_raw);
+
+        let handles = self.pending_writes.lock().unwrap().remove(&path_str).unwrap_or_default();
+        
+        let mut success = true;
+        self.api_client.block_on(async {
+            for handle in handles {
+                if let Ok(Err(_)) | Err(_) = handle.await {
+                    success = false;
+                }
+            }
+        });
+
+        if success {
+            Ok(())
+        } else {
+            Err(STATUS_IO_DEVICE_ERROR)
+        }
+    }
+
+    fn cleanup(&'h self, file_name: &U16CStr, _info: &OperationInfo<'c, 'h, Self>, _context: &'c Self::Context) {
+        let _guard = self.api_client.enter_runtime();
+        
+        let path_raw = file_name.to_string_lossy();
+        let path_str = normalize_remote_path(&path_raw);
+
+        let handles = self.pending_writes.lock().unwrap().remove(&path_str).unwrap_or_default();
+        
+        self.api_client.block_on(async {
+            for handle in handles {
+                let _ = handle.await;
+            }
+        });
+    }
 }
 
 pub fn run_dokany_client(api_client: ApiClient, mountpoint: String) -> Result<()> {
@@ -478,6 +541,7 @@ pub fn run_dokany_client(api_client: ApiClient, mountpoint: String) -> Result<()
         ino_counter: Mutex::new(2),
         cache: Mutex::new(CacheManager::new()),
         last_cleanup: Mutex::new(Instant::now()),
+        pending_writes: Mutex::new(HashMap::new()),
     });
 
     let mut options = MountOptions::default();

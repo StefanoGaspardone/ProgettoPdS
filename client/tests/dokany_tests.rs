@@ -32,6 +32,7 @@ mod dokany {
                 ino_counter: Mutex::new(2),
                 cache: Mutex::new(CacheManager::new()),
                 last_cleanup: Mutex::new(Instant::now()),
+                pending_writes: Mutex::new(HashMap::new()),
             };
 
             (rt, fs)
@@ -201,6 +202,94 @@ mod dokany {
                 .expect("last_cleanup lock")
                 .elapsed();
             assert!(elapsed < Duration::from_secs(1));
+        }
+
+        #[test]
+        fn test_dokany_async_write_and_flush_performance() {
+            let server = MockServer::start();
+            let write_mock = server.mock(|when, then| {
+                when.method(httpmock::Method::PATCH).path("/files/dokany_speed.bin");
+                // Simulate a 100ms network delay per chunk
+                then.delay(Duration::from_millis(100)).status(200);
+            });
+
+            let (_rt, fs) = make_fs(&server);
+            let _guard = fs.api_client.enter_runtime();
+
+            let path = "dokany_speed.bin".to_string();
+            
+            let start_queue = Instant::now();
+            
+            // Simulate 10 concurrent chunks being written
+            for i in 0..10 {
+                let api_clone = fs.api_client.clone();
+                let path_clone = path.clone();
+                let offset = i * 1024;
+                
+                let handle = fs.api_client.spawn_task_with_handle(async move {
+                    api_clone.write_file_chunk_async(&path_clone, offset, vec![0; 1024]).await
+                });
+                
+                fs.pending_writes.lock().unwrap().entry(path.clone()).or_default().push(handle);
+            }
+            
+            let queue_duration = start_queue.elapsed();
+            let start_flush = Instant::now();
+            
+            // Wait for internal cleanup/flush buffers
+            let handles = fs.pending_writes.lock().unwrap().remove(&path).unwrap_or_default();
+            let mut success = true;
+            fs.api_client.block_on(async {
+                for handle in handles {
+                    if let Ok(Err(_)) | Err(_) = handle.await {
+                        success = false;
+                    }
+                }
+            });
+            
+            let flush_duration = start_flush.elapsed();
+            
+            assert!(success, "All writes should succeed");
+            write_mock.assert_hits(10);
+            
+            // Similar to FUSE, verify it operates asynchronously
+            assert!(queue_duration < Duration::from_millis(200), "Queuing took too long: {:?}", queue_duration);
+            assert!(flush_duration >= Duration::from_millis(100), "Flush too fast: {:?}", flush_duration);
+            assert!(flush_duration < Duration::from_millis(800), "Flush too slow (not concurrent): {:?}", flush_duration);
+        }
+
+        #[test]
+        fn test_dokany_async_write_failure_propagation() {
+            let server = MockServer::start();
+            let write_mock = server.mock(|when, then| {
+                when.method(httpmock::Method::PATCH).path("/files/fail.bin");
+                then.status(400); // Fails immediately, no retry loop
+            });
+
+            let (_rt, fs) = make_fs(&server);
+            let _guard = fs.api_client.enter_runtime();
+
+            let path = "fail.bin".to_string();
+            
+            let api_clone = fs.api_client.clone();
+            let path_clone = path.clone();
+            let handle = fs.api_client.spawn_task_with_handle(async move {
+                api_clone.write_file_chunk_async(&path_clone, 0, vec![1, 2, 3]).await
+            });
+            fs.pending_writes.lock().unwrap().entry(path.clone()).or_default().push(handle);
+            
+            let handles = fs.pending_writes.lock().unwrap().remove(&path).unwrap_or_default();
+            let mut success = true;
+            fs.api_client.block_on(async {
+                for handle in handles {
+                    if let Ok(Err(_)) | Err(_) = handle.await {
+                        success = false;
+                    }
+                }
+            });
+            
+            assert!(!success, "Write should fail and propagate I/O rejection to flush");
+            write_mock.assert_hits(1);
         }
     }
 }

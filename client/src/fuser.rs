@@ -290,6 +290,7 @@ pub struct FuserFS {
     file_handles: Arc<Mutex<FileHandleTable>>,
     cache: Arc<Mutex<CacheManager>>,
     path_locks: Arc<PathLockManager>,
+    pending_writes: Arc<Mutex<HashMap<u64, Vec<tokio::task::JoinHandle<Result<(), crate::apis::ApiError>>>>>>,
 }
 
 impl FuserFS {
@@ -303,6 +304,7 @@ impl FuserFS {
             file_handles: Arc::new(Mutex::new(FileHandleTable::new())),
             cache: Arc::new(Mutex::new(CacheManager::new())),
             path_locks: Arc::new(PathLockManager::new()),
+            pending_writes: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -607,7 +609,23 @@ impl Filesystem for FuserFS {
 
     fn flush(&self, _req: &Request, ino: INodeNo, fh: FileHandle, lock_owner: LockOwner, reply: ReplyEmpty) {
         log::info!("[FUSE] flush ino={} fh={} lock_owner={:?}", ino.0, fh.0, lock_owner);
-        reply.ok();
+        
+        let handles = self.pending_writes.lock().unwrap().remove(&ino.0).unwrap_or_default();
+        
+        let mut success = true;
+        self.api_client.block_on(async {
+            for handle in handles {
+                if let Ok(Err(_)) | Err(_) = handle.await {
+                    success = false;
+                }
+            }
+        });
+        
+        if success {
+            reply.ok();
+        } else {
+            reply.error(as_errno(libc::EIO));
+        }
     }
 
     fn read(
@@ -705,20 +723,50 @@ impl Filesystem for FuserFS {
         let path_lock = self.path_locks.get_lock(&inode.path);
         let _guard = path_lock.lock().unwrap();
 
-        match self.api_client.write_file_chunk(&inode.path, offset, data) {
-            Ok(_) => {
-                self.invalidate_all_for_path(&inode.path);
-                if let Some(node) = self.inode_table.write().unwrap().get_mut(ino.0) {
-                    let new_size = (offset + (data.len() as u64)).max(node.attr.size);
-                    node.attr.size = new_size;
-                    node.attr.mtime = SystemTime::now();
-                    node.cached_at = Instant::now();
-                }
-                
-                reply.written(data.len() as u32);
+        let data_vec = data.to_vec();
+        let api = self.api_client.clone();
+        let path_clone = inode.path.clone();
+
+        let handle = self.api_client.spawn_task_with_handle(async move {
+            api.write_file_chunk_async(&path_clone, offset, data_vec).await
+        });
+
+        let to_await = {
+            let mut pending = self.pending_writes.lock().unwrap();
+            let handles = pending.entry(ino.0).or_default();
+            handles.push(handle);
+            
+            if handles.len() > 32 {
+                handles.drain(0..16).collect::<Vec<_>>()
+            } else {
+                Vec::new()
             }
-            Err(e) => reply.error(as_errno(e.errno)),
+        };
+
+        let mut success = true;
+        if !to_await.is_empty() {
+            self.api_client.block_on(async {
+                for h in to_await {
+                    if let Ok(Err(_)) | Err(_) = h.await {
+                        success = false;
+                    }
+                }
+            });
         }
+        if !success {
+            reply.error(as_errno(libc::EIO));
+            return;
+        }
+
+        self.invalidate_all_for_path(&inode.path);
+        if let Some(node) = self.inode_table.write().unwrap().get_mut(ino.0) {
+            let new_size = (offset + (data.len() as u64)).max(node.attr.size);
+            node.attr.size = new_size;
+            node.attr.mtime = SystemTime::now();
+            node.cached_at = Instant::now();
+        }
+        
+        reply.written(data.len() as u32);
     }
 
     fn mkdir(
@@ -948,6 +996,27 @@ impl Filesystem for FuserFS {
             reply.size(0);
         } else {
             reply.data(&[]);
+        }
+    }
+
+    fn fsync(&self, _req: &Request, ino: INodeNo, fh: FileHandle, datasync: bool, reply: ReplyEmpty) {
+        log::info!("[FUSE] fsync ino={} fh={} datasync={}", ino.0, fh.0, datasync);
+        
+        let handles = self.pending_writes.lock().unwrap().remove(&ino.0).unwrap_or_default();
+        
+        let mut success = true;
+        self.api_client.block_on(async {
+            for handle in handles {
+                if let Ok(Err(_)) | Err(_) = handle.await {
+                    success = false;
+                }
+            }
+        });
+        
+        if success {
+            reply.ok();
+        } else {
+            reply.error(as_errno(libc::EIO));
         }
     }
 }
