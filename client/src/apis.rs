@@ -49,7 +49,7 @@ impl ApiClient {
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(60))
             .tcp_nodelay(true)
-            .pool_max_idle_per_host(32)
+            .pool_max_idle_per_host(64)
             .build()
             .context("Failed to create HTTP client")?;
 
@@ -86,10 +86,12 @@ impl ApiClient {
         let max_retries = 4;
         let mut attempt = 0;
         
+        let chunk_bytes = bytes::Bytes::from(data);
+        
         loop {
             let response = self.client.patch(&url)
                 .header("Content-Range", format!("bytes {}-{}/*", offset, end))
-                .body(data.clone())
+                .body(chunk_bytes.clone())
                 .send()
                 .await;
 

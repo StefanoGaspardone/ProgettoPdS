@@ -249,7 +249,7 @@ pub async fn read_file(
 
     match tokio::fs::File::open(&full_path).await {
         Ok(file) => {
-            let stream = ReaderStream::new(file);
+            let stream = ReaderStream::with_capacity(file, 65536);
             
             Ok(HttpResponse::Ok()
                 .content_type("application/octet-stream")
@@ -278,14 +278,16 @@ pub async fn write_file(
 
     match tokio::fs::File::create(&full_path).await {
         Ok(mut file) => {
+            let mut buf_writer = tokio::io::BufWriter::with_capacity(128 * 1024, file);
             let mut total: usize = 0;
             
             while let Some(chunk) = payload.next().await {
                 let bytes = chunk.map_err(actix_web::error::ErrorBadRequest)?;
-                file.write_all(&bytes).await.map_err(actix_web::error::ErrorInternalServerError)?;
+                buf_writer.write_all(&bytes).await.map_err(actix_web::error::ErrorInternalServerError)?;
                 total += bytes.len();
             }
             
+            buf_writer.flush().await.map_err(actix_web::error::ErrorInternalServerError)?;
             Ok(HttpResponse::Ok().json(ApiResponse { success: true, message: None, bytes_written: Some(total) }))
         }
         Err(e) => Ok(fs_error_json(&e, "Failed to write file")),
@@ -339,7 +341,6 @@ pub async fn patch_file(
     }
 
     let mut file = match tokio::fs::OpenOptions::new()
-        .read(true)
         .write(true)
         .create(true)
         .open(&full_path)
@@ -353,6 +354,7 @@ pub async fn patch_file(
         return Ok(fs_error_json(&e, "Failed to seek"));
     }
 
+    let mut buf_writer = tokio::io::BufWriter::with_capacity(128 * 1024, file);
     let mut total: usize = 0;
     while let Some(chunk) = payload.next().await {
         let bytes = chunk.map_err(actix_web::error::ErrorBadRequest)?;
@@ -360,11 +362,15 @@ pub async fn patch_file(
             return Ok(HttpResponse::BadRequest().json("Payload larger than Content-Range"));
         }
         
-        if let Err(e) = file.write_all(&bytes).await {
+        if let Err(e) = buf_writer.write_all(&bytes).await {
             return Ok(fs_error_json(&e, "Failed to write chunk"));
         }
         
         total += bytes.len();
+    }
+
+    if let Err(e) = buf_writer.flush().await {
+        return Ok(fs_error_json(&e, "Failed to flush chunk"));
     }
 
     if (total as u64) != expected_len {

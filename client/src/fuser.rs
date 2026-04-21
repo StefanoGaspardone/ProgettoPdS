@@ -319,11 +319,18 @@ impl FuserFS {
         options.acl = SessionACL::Owner;
         options.mount_options = vec![
             MountOption::FSName("FuserFS".to_string()),
+            MountOption::Custom("max_read=1048576".to_string()),
+            MountOption::Custom("max_write=1048576".to_string()),
+            MountOption::Custom("max_readahead=1048576".to_string()),
         ];
 
         #[cfg(target_os = "linux")]
         {
             options.mount_options.push(MountOption::DefaultPermissions);
+            options.mount_options.push(MountOption::Custom("auto_cache".to_string()));
+            options.mount_options.push(MountOption::Custom("big_writes".to_string()));
+            options.mount_options.push(MountOption::Custom("max_background=128".to_string()));
+            options.mount_options.push(MountOption::Custom("congestion_threshold=96".to_string()));
 
             let default_threads = std::thread::available_parallelism()
                 .map(|n| n.get().clamp(2, 8))
@@ -349,6 +356,8 @@ impl FuserFS {
         #[cfg(target_os = "macos")]
         {
             options.mount_options.push(MountOption::RW);
+            options.mount_options.push(MountOption::Custom("auto_cache".to_string()));
+            options.mount_options.push(MountOption::Custom("daemon_timeout=60".to_string()));
         }
 
         log::info!("Mounting filesystem at {}", mountpoint.display());
