@@ -230,14 +230,14 @@ mod dokany {
                     api_clone.write_file_chunk_async(&path_clone, offset, vec![0; 1024]).await
                 });
                 
-                fs.pending_writes.lock().unwrap().entry(path.clone()).or_default().push(handle);
+                fs.pending_writes.lock().unwrap().entry(path.clone()).or_default().handles.push(handle);
             }
             
             let queue_duration = start_queue.elapsed();
             let start_flush = Instant::now();
             
             // Wait for internal cleanup/flush buffers
-            let handles = fs.pending_writes.lock().unwrap().remove(&path).unwrap_or_default();
+            let handles = fs.pending_writes.lock().unwrap().remove(&path).map(|s| s.handles).unwrap_or_default();
             let mut success = true;
             fs.api_client.block_on(async {
                 for handle in handles {
@@ -276,9 +276,9 @@ mod dokany {
             let handle = fs.api_client.spawn_task_with_handle(async move {
                 api_clone.write_file_chunk_async(&path_clone, 0, vec![1, 2, 3]).await
             });
-            fs.pending_writes.lock().unwrap().entry(path.clone()).or_default().push(handle);
+            fs.pending_writes.lock().unwrap().entry(path.clone()).or_default().handles.push(handle);
             
-            let handles = fs.pending_writes.lock().unwrap().remove(&path).unwrap_or_default();
+            let handles = fs.pending_writes.lock().unwrap().remove(&path).map(|s| s.handles).unwrap_or_default();
             let mut success = true;
             fs.api_client.block_on(async {
                 for handle in handles {

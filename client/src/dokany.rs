@@ -65,12 +65,23 @@ fn split_parent_and_name(path: &str) -> (String, String) {
     }
 }
 
+struct WriteBuffer {
+    offset: u64,
+    data: Vec<u8>,
+}
+
+#[derive(Default)]
+struct FileWriteState {
+    buffer: Option<WriteBuffer>,
+    handles: Vec<tokio::task::JoinHandle<Result<(), crate::apis::ApiError>>>,
+}
+
 struct DokanyFs {
     api_client: Arc<ApiClient>,
     ino_counter: Mutex<u64>,
     cache: Mutex<CacheManager>,
     last_cleanup: Mutex<Instant>,
-    pending_writes: Mutex<HashMap<String, Vec<tokio::task::JoinHandle<Result<(), crate::apis::ApiError>>>>>,
+    pending_writes: Mutex<HashMap<String, FileWriteState>>,
 }
 
 impl DokanyFs {
@@ -344,22 +355,44 @@ impl<'c, 'h> FileSystemHandler<'c, 'h> for DokanyFs where 'h: 'c {
         self.maybe_cleanup_cache();
         let path_raw = file_name.to_string_lossy();
         let path_str = normalize_remote_path(&path_raw);
-
-        let data = buffer.to_vec();
-        let api = self.api_client.clone();
-        let path_clone = path_str.clone();
-
-        let handle = self.api_client.spawn_task_with_handle(async move {
-            api.write_file_chunk_async(&path_clone, offset.max(0) as u64, data).await
-        });
-
+        
+        let offset = offset.max(0) as u64;
+        let mut tasks_to_spawn = Vec::new();
+        let max_buffer_size = 4 * 1024 * 1024; // 4MB buffer to hide latency
+        
         let to_await = {
             let mut pending = self.pending_writes.lock().unwrap();
-            let handles = pending.entry(path_str.clone()).or_default();
-            handles.push(handle);
+            let state = pending.entry(path_str.clone()).or_default();
             
-            if handles.len() > 32 {
-                handles.drain(0..16).collect::<Vec<_>>()
+            if let Some(buf) = &mut state.buffer {
+                if offset == buf.offset + buf.data.len() as u64 {
+                    buf.data.extend_from_slice(buffer);
+                } else {
+                    tasks_to_spawn.push(state.buffer.take().unwrap());
+                    state.buffer = Some(WriteBuffer { offset, data: buffer.to_vec() });
+                }
+            } else {
+                state.buffer = Some(WriteBuffer { offset, data: buffer.to_vec() });
+            }
+            
+            if let Some(buf) = &state.buffer {
+                if buf.data.len() >= max_buffer_size {
+                    tasks_to_spawn.push(state.buffer.take().unwrap());
+                }
+            }
+            
+            for buf in tasks_to_spawn {
+                let api_clone = self.api_client.clone();
+                let path_clone = path_str.clone();
+                let handle = self.api_client.spawn_task_with_handle(async move {
+                    api_clone.write_file_chunk_async(&path_clone, buf.offset, buf.data).await
+                });
+                state.handles.push(handle);
+            }
+            
+            let max_concurrent = 8;
+            if state.handles.len() > max_concurrent {
+                state.handles.drain(0..(state.handles.len() - max_concurrent / 2)).collect::<Vec<_>>()
             } else {
                 Vec::new()
             }
@@ -492,7 +525,22 @@ impl<'c, 'h> FileSystemHandler<'c, 'h> for DokanyFs where 'h: 'c {
         let path_raw = file_name.to_string_lossy();
         let path_str = normalize_remote_path(&path_raw);
 
-        let handles = self.pending_writes.lock().unwrap().remove(&path_str).unwrap_or_default();
+        let handles = {
+            let mut pending = self.pending_writes.lock().unwrap();
+            if let Some(mut state) = pending.remove(&path_str) {
+                if let Some(buf) = state.buffer.take() {
+                    let api_clone = self.api_client.clone();
+                    let path_clone = path_str.clone();
+                    let handle = self.api_client.spawn_task_with_handle(async move {
+                        api_clone.write_file_chunk_async(&path_clone, buf.offset, buf.data).await
+                    });
+                    state.handles.push(handle);
+                }
+                state.handles
+            } else {
+                Vec::new()
+            }
+        };
         
         let mut success = true;
         self.api_client.block_on(async {
@@ -516,7 +564,22 @@ impl<'c, 'h> FileSystemHandler<'c, 'h> for DokanyFs where 'h: 'c {
         let path_raw = file_name.to_string_lossy();
         let path_str = normalize_remote_path(&path_raw);
 
-        let handles = self.pending_writes.lock().unwrap().remove(&path_str).unwrap_or_default();
+        let handles = {
+            let mut pending = self.pending_writes.lock().unwrap();
+            if let Some(mut state) = pending.remove(&path_str) {
+                if let Some(buf) = state.buffer.take() {
+                    let api_clone = self.api_client.clone();
+                    let path_clone = path_str.clone();
+                    let handle = self.api_client.spawn_task_with_handle(async move {
+                        api_clone.write_file_chunk_async(&path_clone, buf.offset, buf.data).await
+                    });
+                    state.handles.push(handle);
+                }
+                state.handles
+            } else {
+                Vec::new()
+            }
+        };
         
         self.api_client.block_on(async {
             for handle in handles {

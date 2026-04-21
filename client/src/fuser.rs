@@ -284,13 +284,24 @@ impl PathLockManager {
     }
 }
 
+struct WriteBuffer {
+    offset: u64,
+    data: Vec<u8>,
+}
+
+#[derive(Default)]
+struct FileWriteState {
+    buffer: Option<WriteBuffer>,
+    handles: Vec<tokio::task::JoinHandle<Result<(), crate::apis::ApiError>>>,
+}
+
 pub struct FuserFS {
     api_client: Arc<ApiClient>,
     inode_table: Arc<RwLock<InodeTable>>,
     file_handles: Arc<Mutex<FileHandleTable>>,
     cache: Arc<Mutex<CacheManager>>,
     path_locks: Arc<PathLockManager>,
-    pending_writes: Arc<Mutex<HashMap<u64, Vec<tokio::task::JoinHandle<Result<(), crate::apis::ApiError>>>>>>,
+    pending_writes: Arc<Mutex<HashMap<u64, FileWriteState>>>,
 }
 
 impl FuserFS {
@@ -319,9 +330,6 @@ impl FuserFS {
         options.acl = SessionACL::Owner;
         options.mount_options = vec![
             MountOption::FSName("FuserFS".to_string()),
-            MountOption::Custom("max_read=1048576".to_string()),
-            MountOption::Custom("max_write=1048576".to_string()),
-            MountOption::Custom("max_readahead=1048576".to_string()),
         ];
 
         #[cfg(target_os = "linux")]
@@ -619,7 +627,28 @@ impl Filesystem for FuserFS {
     fn flush(&self, _req: &Request, ino: INodeNo, fh: FileHandle, lock_owner: LockOwner, reply: ReplyEmpty) {
         log::info!("[FUSE] flush ino={} fh={} lock_owner={:?}", ino.0, fh.0, lock_owner);
         
-        let handles = self.pending_writes.lock().unwrap().remove(&ino.0).unwrap_or_default();
+        let path = {
+            let table = self.inode_table.read().unwrap();
+            table.get_cloned(ino.0).map(|inode| inode.path)
+        };
+
+        let handles = if let Some(path_str) = path {
+            let mut pending = self.pending_writes.lock().unwrap();
+            if let Some(mut state) = pending.remove(&ino.0) {
+                if let Some(buf) = state.buffer.take() {
+                    let api_clone = self.api_client.clone();
+                    let handle = self.api_client.spawn_task_with_handle(async move {
+                        api_clone.write_file_chunk_async(&path_str, buf.offset, buf.data).await
+                    });
+                    state.handles.push(handle);
+                }
+                state.handles
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
         
         let mut success = true;
         self.api_client.block_on(async {
@@ -731,22 +760,43 @@ impl Filesystem for FuserFS {
 
         let path_lock = self.path_locks.get_lock(&inode.path);
         let _guard = path_lock.lock().unwrap();
-
-        let data_vec = data.to_vec();
-        let api = self.api_client.clone();
-        let path_clone = inode.path.clone();
-
-        let handle = self.api_client.spawn_task_with_handle(async move {
-            api.write_file_chunk_async(&path_clone, offset, data_vec).await
-        });
-
+        
+        let mut tasks_to_spawn = Vec::new();
+        let max_buffer_size = 4 * 1024 * 1024; // 4MB buffer to hide latency
+        
         let to_await = {
             let mut pending = self.pending_writes.lock().unwrap();
-            let handles = pending.entry(ino.0).or_default();
-            handles.push(handle);
+            let state = pending.entry(ino.0).or_default();
             
-            if handles.len() > 32 {
-                handles.drain(0..16).collect::<Vec<_>>()
+            if let Some(buf) = &mut state.buffer {
+                if offset == buf.offset + buf.data.len() as u64 {
+                    buf.data.extend_from_slice(data);
+                } else {
+                    tasks_to_spawn.push(state.buffer.take().unwrap());
+                    state.buffer = Some(WriteBuffer { offset, data: data.to_vec() });
+                }
+            } else {
+                state.buffer = Some(WriteBuffer { offset, data: data.to_vec() });
+            }
+            
+            if let Some(buf) = &state.buffer {
+                if buf.data.len() >= max_buffer_size {
+                    tasks_to_spawn.push(state.buffer.take().unwrap());
+                }
+            }
+            
+            for buf in tasks_to_spawn {
+                let api_clone = self.api_client.clone();
+                let path_clone = inode.path.clone();
+                let handle = self.api_client.spawn_task_with_handle(async move {
+                    api_clone.write_file_chunk_async(&path_clone, buf.offset, buf.data).await
+                });
+                state.handles.push(handle);
+            }
+            
+            let max_concurrent = 8;
+            if state.handles.len() > max_concurrent {
+                state.handles.drain(0..(state.handles.len() - max_concurrent / 2)).collect::<Vec<_>>()
             } else {
                 Vec::new()
             }
@@ -1011,7 +1061,28 @@ impl Filesystem for FuserFS {
     fn fsync(&self, _req: &Request, ino: INodeNo, fh: FileHandle, datasync: bool, reply: ReplyEmpty) {
         log::info!("[FUSE] fsync ino={} fh={} datasync={}", ino.0, fh.0, datasync);
         
-        let handles = self.pending_writes.lock().unwrap().remove(&ino.0).unwrap_or_default();
+        let path = {
+            let table = self.inode_table.read().unwrap();
+            table.get_cloned(ino.0).map(|inode| inode.path)
+        };
+
+        let handles = if let Some(path_str) = path {
+            let mut pending = self.pending_writes.lock().unwrap();
+            if let Some(mut state) = pending.remove(&ino.0) {
+                if let Some(buf) = state.buffer.take() {
+                    let api_clone = self.api_client.clone();
+                    let handle = self.api_client.spawn_task_with_handle(async move {
+                        api_clone.write_file_chunk_async(&path_str, buf.offset, buf.data).await
+                    });
+                    state.handles.push(handle);
+                }
+                state.handles
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
         
         let mut success = true;
         self.api_client.block_on(async {

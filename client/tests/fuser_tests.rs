@@ -176,14 +176,14 @@ mod fuser {
                     api_clone.write_file_chunk_async(&path_clone, offset, vec![0; 1024]).await
                 });
                 
-                fs.pending_writes.lock().unwrap().entry(ino).or_default().push(handle);
+                fs.pending_writes.lock().unwrap().entry(ino).or_default().handles.push(handle);
             }
             
             let queue_duration = start_queue.elapsed();
             let start_flush = Instant::now();
             
             // Simulate fsync or file close (blocks until all chunk tasks finish)
-            let handles = fs.pending_writes.lock().unwrap().remove(&ino).unwrap_or_default();
+            let handles = fs.pending_writes.lock().unwrap().remove(&ino).map(|s| s.handles).unwrap_or_default();
             let mut success = true;
             fs.api_client.block_on(async {
                 for handle in handles {
@@ -231,9 +231,9 @@ mod fuser {
             let handle = fs.api_client.spawn_task_with_handle(async move {
                 api_clone.write_file_chunk_async(&path, 0, vec![1, 2, 3]).await
             });
-            fs.pending_writes.lock().unwrap().entry(ino).or_default().push(handle);
+            fs.pending_writes.lock().unwrap().entry(ino).or_default().handles.push(handle);
             
-            let handles = fs.pending_writes.lock().unwrap().remove(&ino).unwrap_or_default();
+            let handles = fs.pending_writes.lock().unwrap().remove(&ino).map(|s| s.handles).unwrap_or_default();
             let mut success = true;
             fs.api_client.block_on(async {
                 for handle in handles {
